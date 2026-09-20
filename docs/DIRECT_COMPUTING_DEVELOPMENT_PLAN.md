@@ -586,6 +586,19 @@ Wayland 放在 X11 之后实现。
 `direct-computing --connect <addr> <password>` 启动 Viewer；非 Windows Host 使用合成画面，
 Windows Host 使用阶段 1 的桌面采集器。鼠标键盘和证书 TOFU 将在阶段 2 的下一次迭代补齐。
 
+阶段 2 本机验证记录（2026-09-21）：
+
+- `cargo fmt --all -- --check`、`cargo check --workspace --all-targets`、
+  `cargo clippy --workspace --all-targets -- -D warnings` 和 `cargo test --workspace -j 1`
+  均通过；工作区单元测试和文档测试没有失败项。
+- 在 Windows 本机启动 `--host 127.0.0.1:22100`，使用正确密码启动
+  `--connect 127.0.0.1:22100`；两个进程持续运行 15 秒，未报告 QUIC/TLS、认证或解码错误，
+  随后正常清理进程。
+- 使用错误密码连接时，Host 记录 `authentication failed`，Viewer 收到连接关闭；认证拒绝路径
+  符合预期。
+- 本记录验证的是本机进程间连接和协议路径，不替代 Windows ↔ Windows 长时间串流、真实窗口
+  交互、鼠标键盘注入和证书 TOFU 验证；这些项目仍保持未完成状态。
+
 ### 阶段 3：文件传输和桌面优化
 
 - 当前实现进度（2026-09-21）：
