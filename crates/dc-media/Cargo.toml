@@ -6,9 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 description = "Media encoding and decoding for Direct Computing"
 
+[features]
+default = ["openh264"]
+openh264 = ["dep:openh264"]
+
 [dependencies]
 dc-common = { path = "../dc-common" }
-openh264 = "0.9.8"
+openh264 = { version = "0.9.8", optional = true }
 
 [lints]
 workspace = true

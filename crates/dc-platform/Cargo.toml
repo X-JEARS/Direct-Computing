@@ -7,7 +7,19 @@ rust-version.workspace = true
 description = "Platform adapters for Direct Computing"
 
 [dependencies]
-dc-media = { path = "../dc-media" }
+dc-common = { path = "../dc-common" }
+dc-media = { path = "../dc-media", default-features = false }
 
-[lints]
-workspace = true
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+] }
+
+# FFI is isolated in this crate; all other workspace crates continue to forbid unsafe code.
+[lints.rust]
+unsafe_code = "allow"

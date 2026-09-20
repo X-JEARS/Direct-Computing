@@ -2,6 +2,11 @@
 
 pub use dc_media::FrameSource as ScreenCapturer;
 
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::WindowsDesktopCapturer;
+
 pub trait InputInjector {}
 pub trait ClipboardProvider {}
 pub trait TerminalBackend {}

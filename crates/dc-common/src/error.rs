@@ -6,6 +6,7 @@ pub enum DcError {
     InvalidInput(String),
     Unsupported(String),
     Codec(String),
+    Platform(String),
     Io(std::io::Error),
 }
 
@@ -15,6 +16,7 @@ impl fmt::Display for DcError {
             Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported: {message}"),
             Self::Codec(message) => write!(f, "codec error: {message}"),
+            Self::Platform(message) => write!(f, "platform error: {message}"),
             Self::Io(error) => write!(f, "I/O error: {error}"),
         }
     }
@@ -24,7 +26,9 @@ impl std::error::Error for DcError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::InvalidInput(_) | Self::Unsupported(_) | Self::Codec(_) => None,
+            Self::InvalidInput(_) | Self::Unsupported(_) | Self::Codec(_) | Self::Platform(_) => {
+                None
+            }
         }
     }
 }

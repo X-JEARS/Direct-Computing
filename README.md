@@ -39,6 +39,16 @@ Run the synthetic H.264 encode/decode loopback prototype with:
 cargo run -p direct-computing -- --loopback 30
 ```
 
+On Windows, capture 60 desktop frames through DXGI and the H.264 loopback, then save the last
+decoded frame as a PPM image:
+
+```powershell
+cargo run -p direct-computing -- --capture-test 60 0 dc-capture-test.bmp
+```
+
+See [`docs/WINDOWS_CAPTURE_TESTING.md`](docs/WINDOWS_CAPTURE_TESTING.md) for prerequisites and the
+runtime test matrix.
+
 See [`docs/DIRECT_COMPUTING_DEVELOPMENT_PLAN.md`](docs/DIRECT_COMPUTING_DEVELOPMENT_PLAN.md)
 for the complete roadmap.
 
