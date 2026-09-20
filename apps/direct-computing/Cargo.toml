@@ -7,9 +7,14 @@ rust-version.workspace = true
 
 [dependencies]
 dc-common = { path = "../../crates/dc-common" }
+dc-auth = { path = "../../crates/dc-auth" }
+dc-desktop = { path = "../../crates/dc-desktop" }
 dc-media = { path = "../../crates/dc-media" }
 dc-protocol = { path = "../../crates/dc-protocol" }
+dc-session = { path = "../../crates/dc-session" }
+dc-transport = { path = "../../crates/dc-transport" }
 dc-ui = { path = "../../crates/dc-ui" }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 dc-platform = { path = "../../crates/dc-platform" }

@@ -8,6 +8,8 @@ description = "Remote desktop orchestration for Direct Computing"
 
 [dependencies]
 dc-media = { path = "../dc-media" }
+dc-common = { path = "../dc-common" }
+dc-protocol = { path = "../dc-protocol" }
 
 [lints]
 workspace = true

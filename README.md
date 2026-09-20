@@ -3,7 +3,7 @@
 Direct Computing is an early-stage, open-source remote desktop, file transfer, and remote
 terminal project for direct connections over LAN, IPv6, or VPN networks.
 
-The project is currently in **stage 1: local media loopback**. It intentionally does not include
+The project is currently in **stage 2: LAN desktop direct connection**. It intentionally does not include
 NAT traversal, a central account service, or a relay service.
 
 ## Workspace
@@ -32,6 +32,18 @@ Run the bootstrap binaries with:
 cargo run -p direct-computing
 cargo run -p dc-cli
 ```
+
+Start a local host and connect a viewer with an address and password:
+
+```sh
+cargo run -p direct-computing -- --host 0.0.0.0:22100 '<password>'
+cargo run -p direct-computing -- --connect 192.168.1.20:22100 '<password>'
+```
+
+The stage 2 path uses QUIC/TLS 1.3, protocol capability negotiation, Argon2id-derived challenge
+authentication, and H.264 desktop packets on independent streams. The current host uses the real
+Windows capture adapter on Windows and a synthetic source elsewhere; mouse/keyboard injection and
+certificate TOFU are still tracked as stage 2 follow-up work.
 
 Run the synthetic H.264 encode/decode loopback prototype with:
 

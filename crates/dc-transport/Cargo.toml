@@ -6,5 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 description = "QUIC transport abstraction for Direct Computing"
 
+[dependencies]
+dc-common = { path = "../dc-common" }
+dc-protocol = { path = "../dc-protocol" }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "time"] }
+
 [lints]
 workspace = true

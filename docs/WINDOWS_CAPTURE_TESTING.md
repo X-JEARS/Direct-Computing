@@ -1,8 +1,8 @@
 # Windows screen capture testing
 
 This checklist validates the stage 1 DXGI Desktop Duplication prototype on a Windows 10 or
-Windows 11 machine. The primary-display frame export has passed an initial Windows hardware test;
-the live preview and extended runtime scenarios below remain the current validation target.
+Windows 11 machine. The primary-display frame export and short live-preview checks have passed on
+the environment recorded below; the extended runtime and hardware-matrix scenarios remain open.
 
 ## Prerequisites
 
@@ -94,3 +94,34 @@ continuously. A clean short run does not replace this long-duration check.
 Lock-screen, UAC secure-desktop, display hot-plug, rotation, and automatic recovery after
 `DXGI_ERROR_ACCESS_LOST` are not stage 1 supported behaviors yet. They should fail visibly and must
 not crash or hang the process.
+
+## Validation record
+
+The following results were recorded on 2026-09-21. They are evidence for the commands that were
+actually run, not a substitute for the scenario matrix above.
+
+- Environment: Windows 11 Home 64-bit, build 26200; AMD Radeon(TM) Graphics, driver
+  `31.0.21924.61`; one physical output, `\\.\DISPLAY1`, at 1920x1200. The available display
+  scaling was not changed for this run.
+- `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace`: passed.
+- `cargo run -p direct-computing -- --capture-test 60 0 dc-capture-test.bmp`: passed on the
+  primary output; the exported 1920x1200 32-bit BMP was non-black, upright, and had correct color
+  channels.
+- `cargo run -p direct-computing -- --window-test 10`: passed and exited with code 0 after about
+  10 seconds.
+- `cargo run -p direct-computing -- --preview 0 130`: passed and exited with code 0 after about
+  130 seconds, including the previous skipped-frame failure point. Skipped H.264 frames were
+  reported and did not terminate the preview.
+- `--capture-test 10 1 ...` was attempted and correctly failed because this machine has no DXGI
+  output index `1`; this is not evidence of a second-display failure.
+- A 30-minute `--preview 0 1800` run completed from a logged-in, unlocked Windows desktop:
+  `elapsed=1800.28s`, `preview complete`, and no application error appeared in the run log. The
+  808 interval reports ranged from 0.1 to 1.3 FPS (average 0.75 FPS), with 9 skipped frames in
+  total. Average capture, encode, decode, and display times were 5.7 ms, 1450.5 ms, 353.1 ms,
+  and 115.3 ms respectively. The log did not include process memory, CPU, GPU, or handle samples,
+  so resource-growth and utilization conclusions still require a rerun with external monitoring.
+
+Window resizing, Escape, and close-window behavior also require an interactive desktop window and
+were not claimed as automated passes in this record. Do not mark those checks complete without
+observing the actual preview window.
