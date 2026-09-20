@@ -1,0 +1,10 @@
+[package]
+name = "dc-terminal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Interactive terminal sessions for Direct Computing"
+
+[lints]
+workspace = true

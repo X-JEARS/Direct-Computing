@@ -1,0 +1,10 @@
+[package]
+name = "dc-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Remote desktop orchestration for Direct Computing"
+
+[lints]
+workspace = true

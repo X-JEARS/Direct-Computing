@@ -1,0 +1,10 @@
+[package]
+name = "dc-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Session lifecycle for Direct Computing"
+
+[lints]
+workspace = true

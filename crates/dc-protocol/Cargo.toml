@@ -1,0 +1,12 @@
+[package]
+name = "dc-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dc-common = { path = "../dc-common" }
+
+[lints]
+workspace = true

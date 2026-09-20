@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dc-common",
+    "crates/dc-protocol",
+    "crates/dc-transport",
+    "crates/dc-auth",
+    "crates/dc-session",
+    "crates/dc-desktop",
+    "crates/dc-media",
+    "crates/dc-terminal",
+    "crates/dc-command",
+    "crates/dc-file-transfer",
+    "crates/dc-ssh",
+    "crates/dc-platform",
+    "crates/dc-ui",
+    "apps/direct-computing",
+    "apps/dc-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

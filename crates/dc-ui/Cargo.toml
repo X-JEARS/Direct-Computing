@@ -1,0 +1,10 @@
+[package]
+name = "dc-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared user-interface layer for Direct Computing"
+
+[lints]
+workspace = true

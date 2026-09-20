@@ -1,0 +1,13 @@
+[package]
+name = "direct-computing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dc-common = { path = "../../crates/dc-common" }
+dc-protocol = { path = "../../crates/dc-protocol" }
+
+[lints]
+workspace = true
