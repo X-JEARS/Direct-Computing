@@ -115,11 +115,12 @@ actually run, not a substitute for the scenario matrix above.
   reported and did not terminate the preview.
 - `--capture-test 10 1 ...` was attempted and correctly failed because this machine has no DXGI
   output index `1`; this is not evidence of a second-display failure.
-- A 30-minute `--preview 0 1800` run was attempted from the automation session but DXGI returned
-  `0x80070005 (E_ACCESSDENIED)` before capture started. The session was not attached to the
-  interactive desktop, so no 30-minute FPS, memory, CPU, or GPU measurements are claimed here.
-  Run that command from a logged-in, unlocked Windows desktop and record the requested resource
-  values before marking the long-duration checkbox complete.
+- A 30-minute `--preview 0 1800` run completed from a logged-in, unlocked Windows desktop:
+  `elapsed=1800.28s`, `preview complete`, and no application error appeared in the run log. The
+  808 interval reports ranged from 0.1 to 1.3 FPS (average 0.75 FPS), with 9 skipped frames in
+  total. Average capture, encode, decode, and display times were 5.7 ms, 1450.5 ms, 353.1 ms,
+  and 115.3 ms respectively. The log did not include process memory, CPU, GPU, or handle samples,
+  so resource-growth and utilization conclusions still require a rerun with external monitoring.
 
 Window resizing, Escape, and close-window behavior also require an interactive desktop window and
 were not claimed as automated passes in this record. Do not mark those checks complete without
