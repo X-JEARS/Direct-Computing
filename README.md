@@ -3,7 +3,7 @@
 Direct Computing is an early-stage, open-source remote desktop, file transfer, and remote
 terminal project for direct connections over LAN, IPv6, or VPN networks.
 
-The project is currently in **stage 2: LAN desktop direct connection**. It intentionally does not include
+The project is currently in **stage 3: file transfer foundations**. It intentionally does not include
 NAT traversal, a central account service, or a relay service.
 
 ## Workspace
@@ -44,6 +44,10 @@ The stage 2 path uses QUIC/TLS 1.3, protocol capability negotiation, Argon2id-de
 authentication, and H.264 desktop packets on independent streams. The current host uses the real
 Windows capture adapter on Windows and a synthetic source elsewhere; mouse/keyboard injection and
 certificate TOFU are still tracked as stage 2 follow-up work.
+
+Stage 3 now includes bounded file manifests, fixed-size chunks, SHA-256 checksums, resume-offset
+validation, safe destination paths, and `FileOffer`/`FileChunk`/`FileAck` protocol messages. The
+network file-transfer service and CLI are the next integration tasks.
 
 Run the synthetic H.264 encode/decode loopback prototype with:
 

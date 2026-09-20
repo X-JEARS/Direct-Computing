@@ -83,6 +83,23 @@ pub enum WireMessage {
         bitrate: u32,
         frames_per_second: u16,
     },
+    FileOffer {
+        transfer_id: [u8; 16],
+        name: String,
+        size: u64,
+        chunk_size: u32,
+        sha256: [u8; 32],
+    },
+    FileChunk {
+        transfer_id: [u8; 16],
+        offset: u64,
+        data: Vec<u8>,
+        sha256: [u8; 32],
+    },
+    FileAck {
+        transfer_id: [u8; 16],
+        next_offset: u64,
+    },
     Close,
 }
 
@@ -163,7 +180,41 @@ impl WireMessage {
                 put_u32(&mut output, *bitrate);
                 put_u16(&mut output, *frames_per_second);
             }
-            Self::Close => output.push(10),
+            Self::FileOffer {
+                transfer_id,
+                name,
+                size,
+                chunk_size,
+                sha256,
+            } => {
+                output.push(10);
+                output.extend_from_slice(transfer_id);
+                put_string(&mut output, name)?;
+                put_u64(&mut output, *size);
+                put_u32(&mut output, *chunk_size);
+                output.extend_from_slice(sha256);
+            }
+            Self::FileChunk {
+                transfer_id,
+                offset,
+                data,
+                sha256,
+            } => {
+                output.push(11);
+                output.extend_from_slice(transfer_id);
+                put_u64(&mut output, *offset);
+                put_bytes(&mut output, data)?;
+                output.extend_from_slice(sha256);
+            }
+            Self::FileAck {
+                transfer_id,
+                next_offset,
+            } => {
+                output.push(12);
+                output.extend_from_slice(transfer_id);
+                put_u64(&mut output, *next_offset);
+            }
+            Self::Close => output.push(13),
         }
         if output.len() > MAX_MESSAGE_SIZE {
             return Err(dc_common::DcError::InvalidInput(
@@ -230,7 +281,24 @@ impl WireMessage {
                 bitrate: reader.u32()?,
                 frames_per_second: reader.u16()?,
             },
-            10 => Self::Close,
+            10 => Self::FileOffer {
+                transfer_id: reader.array_16()?,
+                name: reader.string()?,
+                size: reader.u64()?,
+                chunk_size: reader.u32()?,
+                sha256: reader.array_32()?,
+            },
+            11 => Self::FileChunk {
+                transfer_id: reader.array_16()?,
+                offset: reader.u64()?,
+                data: reader.bytes()?,
+                sha256: reader.array_32()?,
+            },
+            12 => Self::FileAck {
+                transfer_id: reader.array_16()?,
+                next_offset: reader.u64()?,
+            },
+            13 => Self::Close,
             _ => {
                 return Err(dc_common::DcError::Codec(format!(
                     "unknown protocol message type {kind}"
@@ -314,6 +382,9 @@ impl<'a> Reader<'a> {
     fn array_32(&mut self) -> dc_common::Result<[u8; 32]> {
         Ok(self.take(32)?.try_into().unwrap())
     }
+    fn array_16(&mut self) -> dc_common::Result<[u8; 16]> {
+        Ok(self.take(16)?.try_into().unwrap())
+    }
     fn bytes(&mut self) -> dc_common::Result<Vec<u8>> {
         let len = self.u32()? as usize;
         Ok(self.take(len)?.to_vec())
@@ -390,5 +461,19 @@ mod tests {
         let mut encoded = WireMessage::Close.encode().unwrap();
         encoded.push(0);
         assert!(WireMessage::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn file_messages_round_trip_with_checksums() {
+        let message = WireMessage::FileChunk {
+            transfer_id: [7; 16],
+            offset: 256,
+            data: vec![1, 2, 3],
+            sha256: [9; 32],
+        };
+        assert_eq!(
+            WireMessage::decode(&message.encode().unwrap()).unwrap(),
+            message
+        );
     }
 }

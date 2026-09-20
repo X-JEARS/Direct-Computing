@@ -186,6 +186,11 @@ dependencies = [
 [[package]]
 name = "dc-file-transfer"
 version = "0.1.0"
+dependencies = [
+ "dc-common",
+ "dc-protocol",
+ "sha2",
+]
 
 [[package]]
 name = "dc-media"
