@@ -59,7 +59,8 @@ cargo run -p direct-computing -- --preview 0 60
 ```
 
 Pass duration `0` to keep the preview open until the window is closed or Escape is pressed. The
-window title and console report FPS, throughput, and capture/encode/decode/display timings.
+window title and console report FPS, skipped frames, throughput, and capture/encode/decode/display
+timings. OpenH264 rate-control skips are reported and do not terminate the preview.
 
 See [`docs/WINDOWS_CAPTURE_TESTING.md`](docs/WINDOWS_CAPTURE_TESTING.md) for prerequisites and the
 runtime test matrix.

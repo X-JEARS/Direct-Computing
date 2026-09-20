@@ -64,9 +64,13 @@ Verify that:
 - resizing the window preserves the desktop aspect ratio;
 - closing the window and pressing Escape both exit cleanly;
 - a mostly static desktop remains responsive when DXGI reports capture timeouts;
-- the title and console update once per second with FPS, raw and encoded throughput, and average
-  capture, encode, decode, and display time;
+- the title and console update once per second with FPS, skipped-frame count, raw and encoded
+  throughput, and average capture, encode, decode, and display time;
 - the process exits after approximately the requested nonzero duration.
+
+OpenH264 may intentionally skip a frame when its real-time rate control cannot encode it in time.
+Skipped frames are reported by the `skipped` metric and must not terminate the preview or produce an
+empty packet error.
 
 The software H.264 path is not expected to sustain 4K/60 at this stage. Record the displayed
 metrics so later bitrate, pacing, and hardware-encoder work has a baseline.
@@ -84,7 +88,8 @@ version, GPU model, and driver version for failures:
 - laptop display only, external display only, and both displays
 
 After the short scenarios pass, run `--preview 0 0` for 30 minutes. Record starting and ending
-memory use, average CPU/GPU use, FPS range, and whether memory or latency grows continuously.
+memory use, average CPU/GPU use, FPS range, skipped-frame count, and whether memory or latency grows
+continuously. A clean short run does not replace this long-duration check.
 
 Lock-screen, UAC secure-desktop, display hot-plug, rotation, and automatic recovery after
 `DXGI_ERROR_ACCESS_LOST` are not stage 1 supported behaviors yet. They should fail visibly and must

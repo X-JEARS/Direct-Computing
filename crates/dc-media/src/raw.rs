@@ -1,4 +1,6 @@
-use crate::{EncodedVideoPacket, VideoCodec, VideoDecoder, VideoEncoder, VideoFrame};
+use crate::{
+    EncodeOutcome, EncodedVideoPacket, VideoCodec, VideoDecoder, VideoEncoder, VideoFrame,
+};
 use dc_common::{DcError, Result};
 
 #[derive(Debug, Default)]
@@ -9,8 +11,10 @@ impl VideoEncoder for RawVideoEncoder {
         VideoCodec::Raw
     }
 
-    fn encode(&mut self, frame: VideoFrame) -> Result<EncodedVideoPacket> {
-        EncodedVideoPacket::from_raw_frame(frame)
+    fn encode(&mut self, frame: VideoFrame) -> Result<EncodeOutcome> {
+        Ok(EncodeOutcome::Packet(EncodedVideoPacket::from_raw_frame(
+            frame,
+        )?))
     }
 }
 

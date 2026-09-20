@@ -15,7 +15,8 @@ pub use h264::{OpenH264Decoder, OpenH264Encoder};
 pub use output::{write_bmp, LastFrameSink};
 pub use packet::{EncodedVideoPacket, VideoCodec};
 pub use pipeline::{
-    FrameSink, FrameSource, LoopbackPipeline, PipelineStats, VideoDecoder, VideoEncoder,
+    EncodeOutcome, FrameSink, FrameSource, LoopbackPipeline, PipelineStats, VideoDecoder,
+    VideoEncoder,
 };
 pub use raw::{RawVideoDecoder, RawVideoEncoder};
 pub use synthetic::{ChecksumSink, SyntheticFrameSource};

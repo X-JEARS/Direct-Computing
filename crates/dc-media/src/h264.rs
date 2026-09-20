@@ -1,6 +1,6 @@
 use crate::{
-    EncodedVideoPacket, FrameLayout, PixelFormat, VideoCodec, VideoDecoder, VideoEncoder,
-    VideoFrame,
+    EncodeOutcome, EncodedVideoPacket, FrameLayout, PixelFormat, VideoCodec, VideoDecoder,
+    VideoEncoder, VideoFrame,
 };
 use dc_common::{DcError, Result};
 use openh264::decoder::Decoder;
@@ -42,7 +42,7 @@ impl VideoEncoder for OpenH264Encoder {
         VideoCodec::H264
     }
 
-    fn encode(&mut self, frame: VideoFrame) -> Result<EncodedVideoPacket> {
+    fn encode(&mut self, frame: VideoFrame) -> Result<EncodeOutcome> {
         let layout = frame.layout();
         let size = layout.size();
         if size.width() % 2 != 0 || size.height() % 2 != 0 {
@@ -71,16 +71,20 @@ impl VideoEncoder for OpenH264Encoder {
             .encoder
             .encode_at(&yuv, Timestamp::from_millis(timestamp_millis))
             .map_err(|error| DcError::Codec(error.to_string()))?;
-        let keyframe = matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I);
+        let frame_type = bitstream.frame_type();
+        let keyframe = matches!(frame_type, FrameType::IDR | FrameType::I);
         let data = bitstream.to_vec();
-        EncodedVideoPacket::new(
+        if frame_type == FrameType::Skip || data.is_empty() {
+            return Ok(EncodeOutcome::Skipped);
+        }
+        Ok(EncodeOutcome::Packet(EncodedVideoPacket::new(
             VideoCodec::H264,
             frame.sequence(),
             frame.timestamp(),
             keyframe,
             layout,
             data,
-        )
+        )?))
     }
 }
 
@@ -153,7 +157,9 @@ mod tests {
         let frame = source.capture().unwrap();
         let source_len = frame.data().len();
         let mut encoder = OpenH264Encoder::new(500_000, 30.0).unwrap();
-        let packet = encoder.encode(frame).unwrap();
+        let EncodeOutcome::Packet(packet) = encoder.encode(frame).unwrap() else {
+            panic!("the first encoded frame must not be skipped");
+        };
 
         assert_eq!(packet.codec(), VideoCodec::H264);
         assert!(packet.is_keyframe());

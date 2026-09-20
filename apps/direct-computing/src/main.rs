@@ -208,7 +208,11 @@ where
     let mut previous_stats = pipeline.stats();
 
     while pipeline.sink().is_open() && deadline.is_none_or(|value| Instant::now() < value) {
+        let frames_before = pipeline.stats().frames_processed;
         match pipeline.process_next_frame() {
+            Ok(stats) if stats.frames_processed == frames_before => {
+                pipeline.sink_mut().pump_events();
+            }
             Ok(_) => {}
             Err(DcError::Timeout(_)) => pipeline.sink_mut().pump_events(),
             Err(error) => return Err(error),
@@ -248,13 +252,15 @@ where
 fn format_stats(stats: dc_media::PipelineStats, elapsed: Duration) -> String {
     let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
     let frames = stats.frames_processed;
+    let captured_frames = frames.saturating_add(stats.frames_skipped);
     format!(
-        "{:.1} FPS | raw {:.1} MB/s | H.264 {:.1} KB/s | capture {:.1} ms | encode {:.1} ms | decode {:.1} ms | display {:.1} ms",
+        "{:.1} FPS | skipped {} | raw {:.1} MB/s | H.264 {:.1} KB/s | capture {:.1} ms | encode {:.1} ms | decode {:.1} ms | display {:.1} ms",
         frames as f64 / seconds,
+        stats.frames_skipped,
         stats.source_bytes as f64 / seconds / 1_000_000.0,
         stats.encoded_bytes as f64 / seconds / 1_000.0,
-        average_millis(stats.capture_time, frames),
-        average_millis(stats.encode_time, frames),
+        average_millis(stats.capture_time, captured_frames),
+        average_millis(stats.encode_time, captured_frames),
         average_millis(stats.decode_time, frames),
         average_millis(stats.present_time, frames),
     )

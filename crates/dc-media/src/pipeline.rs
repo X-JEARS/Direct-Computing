@@ -8,7 +8,13 @@ pub trait FrameSource {
 
 pub trait VideoEncoder {
     fn codec(&self) -> VideoCodec;
-    fn encode(&mut self, frame: VideoFrame) -> Result<EncodedVideoPacket>;
+    fn encode(&mut self, frame: VideoFrame) -> Result<EncodeOutcome>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EncodeOutcome {
+    Packet(EncodedVideoPacket),
+    Skipped,
 }
 
 pub trait VideoDecoder {
@@ -23,6 +29,7 @@ pub trait FrameSink {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PipelineStats {
     pub frames_processed: u64,
+    pub frames_skipped: u64,
     pub source_bytes: u64,
     pub encoded_bytes: u64,
     pub capture_time: Duration,
@@ -37,6 +44,7 @@ impl PipelineStats {
             frames_processed: self
                 .frames_processed
                 .saturating_sub(earlier.frames_processed),
+            frames_skipped: self.frames_skipped.saturating_sub(earlier.frames_skipped),
             source_bytes: self.source_bytes.saturating_sub(earlier.source_bytes),
             encoded_bytes: self.encoded_bytes.saturating_sub(earlier.encoded_bytes),
             capture_time: self.capture_time.saturating_sub(earlier.capture_time),
@@ -79,8 +87,16 @@ where
         let source_bytes = frame.data().len() as u64;
 
         let started = Instant::now();
-        let packet = self.encoder.encode(frame)?;
+        let outcome = self.encoder.encode(frame)?;
         self.stats.encode_time += started.elapsed();
+        let packet = match outcome {
+            EncodeOutcome::Packet(packet) => packet,
+            EncodeOutcome::Skipped => {
+                self.stats.frames_skipped += 1;
+                self.stats.source_bytes += source_bytes;
+                return Ok(self.stats);
+            }
+        };
         if packet.codec() != self.encoder.codec() {
             return Err(DcError::Codec(format!(
                 "encoder declared {:?} but produced {:?}",
@@ -112,7 +128,8 @@ where
     }
 
     pub fn run_frames(&mut self, count: u64) -> Result<PipelineStats> {
-        for _ in 0..count {
+        let target = self.stats.frames_processed.saturating_add(count);
+        while self.stats.frames_processed < target {
             self.process_next_frame()?;
         }
         Ok(self.stats)
@@ -143,6 +160,7 @@ mod tests {
     fn stats_delta_subtracts_each_measurement() {
         let current = PipelineStats {
             frames_processed: 10,
+            frames_skipped: 3,
             source_bytes: 500,
             encoded_bytes: 50,
             capture_time: Duration::from_millis(40),
@@ -152,6 +170,7 @@ mod tests {
         };
         let earlier = PipelineStats {
             frames_processed: 4,
+            frames_skipped: 1,
             source_bytes: 200,
             encoded_bytes: 20,
             capture_time: Duration::from_millis(10),
@@ -161,11 +180,55 @@ mod tests {
         };
         let delta = current.delta_since(earlier);
         assert_eq!(delta.frames_processed, 6);
+        assert_eq!(delta.frames_skipped, 2);
         assert_eq!(delta.source_bytes, 300);
         assert_eq!(delta.encoded_bytes, 30);
         assert_eq!(delta.capture_time, Duration::from_millis(30));
         assert_eq!(delta.encode_time, Duration::from_millis(50));
         assert_eq!(delta.decode_time, Duration::from_millis(15));
         assert_eq!(delta.present_time, Duration::from_millis(7));
+    }
+
+    struct SkipOnceEncoder {
+        skipped: bool,
+    }
+
+    impl VideoEncoder for SkipOnceEncoder {
+        fn codec(&self) -> VideoCodec {
+            VideoCodec::Raw
+        }
+
+        fn encode(&mut self, frame: VideoFrame) -> Result<EncodeOutcome> {
+            if !self.skipped {
+                self.skipped = true;
+                Ok(EncodeOutcome::Skipped)
+            } else {
+                Ok(EncodeOutcome::Packet(EncodedVideoPacket::from_raw_frame(
+                    frame,
+                )?))
+            }
+        }
+    }
+
+    #[test]
+    fn run_frames_retries_after_an_encoder_skip() {
+        let size = crate::FrameSize::new(8, 6).unwrap();
+        let frame_bytes = u64::from(size.width() * size.height() * 4);
+        let source = crate::SyntheticFrameSource::new(size, 30).unwrap();
+        let mut pipeline = LoopbackPipeline::new(
+            source,
+            SkipOnceEncoder { skipped: false },
+            crate::RawVideoDecoder,
+            crate::ChecksumSink::default(),
+        );
+
+        let stats = pipeline.run_frames(1).unwrap();
+
+        assert_eq!(stats.frames_processed, 1);
+        assert_eq!(stats.frames_skipped, 1);
+        assert_eq!(stats.source_bytes, frame_bytes * 2);
+        assert_eq!(stats.encoded_bytes, frame_bytes);
+        assert_eq!(pipeline.sink().frames_presented(), 1);
+        assert_eq!(pipeline.sink().last_sequence(), Some(1));
     }
 }
