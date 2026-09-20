@@ -96,7 +96,7 @@ impl FrameSource for WindowsDesktopCapturer {
         };
         if let Err(error) = acquire_result {
             return if error.code() == DXGI_ERROR_WAIT_TIMEOUT {
-                Err(DcError::Platform(format!(
+                Err(DcError::Timeout(format!(
                     "timed out after {} ms waiting for desktop frame",
                     self.timeout_ms
                 )))

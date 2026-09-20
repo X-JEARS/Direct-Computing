@@ -39,12 +39,27 @@ Run the synthetic H.264 encode/decode loopback prototype with:
 cargo run -p direct-computing -- --loopback 30
 ```
 
+Open a cross-platform synthetic decoded-frame window for 10 seconds with:
+
+```sh
+cargo run -p direct-computing -- --window-test 10
+```
+
 On Windows, capture 60 desktop frames through DXGI and the H.264 loopback, then save the last
-decoded frame as a PPM image:
+decoded frame as a BMP image:
 
 ```powershell
 cargo run -p direct-computing -- --capture-test 60 0 dc-capture-test.bmp
 ```
+
+Run a 60-second live preview of the primary display with:
+
+```powershell
+cargo run -p direct-computing -- --preview 0 60
+```
+
+Pass duration `0` to keep the preview open until the window is closed or Escape is pressed. The
+window title and console report FPS, throughput, and capture/encode/decode/display timings.
 
 See [`docs/WINDOWS_CAPTURE_TESTING.md`](docs/WINDOWS_CAPTURE_TESTING.md) for prerequisites and the
 runtime test matrix.

@@ -7,6 +7,7 @@ pub enum DcError {
     Unsupported(String),
     Codec(String),
     Platform(String),
+    Timeout(String),
     Io(std::io::Error),
 }
 
@@ -17,6 +18,7 @@ impl fmt::Display for DcError {
             Self::Unsupported(message) => write!(f, "unsupported: {message}"),
             Self::Codec(message) => write!(f, "codec error: {message}"),
             Self::Platform(message) => write!(f, "platform error: {message}"),
+            Self::Timeout(message) => write!(f, "timeout: {message}"),
             Self::Io(error) => write!(f, "I/O error: {error}"),
         }
     }
@@ -26,9 +28,11 @@ impl std::error::Error for DcError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::InvalidInput(_) | Self::Unsupported(_) | Self::Codec(_) | Self::Platform(_) => {
-                None
-            }
+            Self::InvalidInput(_)
+            | Self::Unsupported(_)
+            | Self::Codec(_)
+            | Self::Platform(_)
+            | Self::Timeout(_) => None,
         }
     }
 }

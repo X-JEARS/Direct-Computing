@@ -6,5 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 description = "Shared user-interface layer for Direct Computing"
 
+[dependencies]
+dc-common = { path = "../dc-common" }
+dc-media = { path = "../dc-media", default-features = false }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+minifb = { version = "0.28.0", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+minifb = { version = "0.28.0", default-features = false, features = ["x11"] }
+
 [lints]
 workspace = true

@@ -13,12 +13,16 @@ crate's source distribution.
 | jobserver | 0.1.35 | MIT OR Apache-2.0 |
 | libc | 0.2.189 | MIT OR Apache-2.0 |
 | log | 0.4.34 | MIT OR Apache-2.0 |
+| minifb | 0.28.0 | MIT OR Apache-2.0 |
 | nasm-rs | 0.3.2 | MIT OR Apache-2.0 |
+| once_cell | 1.21.4 | MIT OR Apache-2.0 |
 | openh264 | 0.9.8 | BSD-2-Clause |
 | openh264-sys2 | 0.9.8 | BSD-2-Clause |
+| pkg-config | 0.3.34 | MIT OR Apache-2.0 |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 |
 | quote | 1.0.47 | MIT OR Apache-2.0 |
 | r-efi | 6.0.0 | MIT OR Apache-2.0 OR LGPL-2.1-or-later |
+| raw-window-handle | 0.6.2 | MIT OR Apache-2.0 OR Zlib |
 | safe_arch | 1.2.0 | Zlib OR Apache-2.0 OR MIT |
 | same-file | 1.0.6 | Unlicense OR MIT |
 | shlex | 2.0.1 | MIT OR Apache-2.0 |
@@ -26,6 +30,7 @@ crate's source distribution.
 | unicode-ident | 1.0.26 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | walkdir | 2.5.0 | Unlicense OR MIT |
 | wide | 1.7.1 | Zlib OR Apache-2.0 OR MIT |
+| winapi | 0.3.9 | MIT OR Apache-2.0 |
 | winapi-util | 0.1.11 | Unlicense OR MIT |
 | windows | 0.62.2 | MIT OR Apache-2.0 |
 | windows-collections | 0.3.2 | MIT OR Apache-2.0 |
@@ -39,6 +44,7 @@ crate's source distribution.
 | windows-strings | 0.5.1 | MIT OR Apache-2.0 |
 | windows-sys | 0.61.2 | MIT OR Apache-2.0 |
 | windows-threading | 0.2.1 | MIT OR Apache-2.0 |
+| x11-dl | 2.21.0 | MIT |
 
 ## OpenH264 distribution note
 

@@ -9,6 +9,7 @@ rust-version.workspace = true
 dc-common = { path = "../../crates/dc-common" }
 dc-media = { path = "../../crates/dc-media" }
 dc-protocol = { path = "../../crates/dc-protocol" }
+dc-ui = { path = "../../crates/dc-ui" }
 
 [target.'cfg(windows)'.dependencies]
 dc-platform = { path = "../../crates/dc-platform" }
