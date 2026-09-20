@@ -569,12 +569,22 @@ Wayland 放在 X11 之后实现。
 
 ### 阶段 2：局域网桌面直连
 
-- QUIC/TLS
-- 地址连接
-- 密码认证
-- 屏幕串流
-- 鼠标键盘
-- 基础码率调整
+当前实现进度（2026-09-21）：
+
+- [x] QUIC/TLS 1.3 端点和独立双向流
+- [x] IP 字面量和 DNS 地址解析
+- [x] 协议版本、能力协商和长度受限的二进制消息
+- [x] Argon2id 密码派生值和一次性挑战认证
+- [x] 权限字段和桌面查看权限门控
+- [x] H.264/Raw 视频包跨网络序列化与解码
+- [x] RTT/丢包/队列/编码耗时驱动的基础码率控制器
+- [ ] Windows SendInput 鼠标键盘注入和 GUI 事件采集
+- [ ] 证书指纹持久化与首次连接确认
+- [ ] 真机 Windows ↔ Windows 长时间串流基准
+
+当前可通过 `direct-computing --host [addr] <password>` 启动 Host，通过
+`direct-computing --connect <addr> <password>` 启动 Viewer；非 Windows Host 使用合成画面，
+Windows Host 使用阶段 1 的桌面采集器。鼠标键盘和证书 TOFU 将在阶段 2 的下一次迭代补齐。
 
 ### 阶段 3：文件传输和桌面优化
 

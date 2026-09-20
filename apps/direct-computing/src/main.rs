@@ -1,4 +1,6 @@
+use dc_auth::{PasswordVerifier, Permissions};
 use dc_common::{init_logging, log, DcError, LogLevel, Result};
+use dc_desktop::{message_to_packet, packet_to_message};
 #[cfg(target_os = "windows")]
 use dc_media::{write_bmp, LastFrameSink};
 use dc_media::{
@@ -8,6 +10,9 @@ use dc_media::{
 #[cfg(target_os = "windows")]
 use dc_platform::WindowsDesktopCapturer;
 use dc_protocol::PROTOCOL_VERSION;
+use dc_protocol::{Capabilities, WireMessage};
+use dc_session::{authenticate_client, authenticate_server};
+use dc_transport::{QuicClient, QuicServer};
 use dc_ui::PreviewWindowSink;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -71,6 +76,31 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<()> {
             }
             run_preview(output_index, duration_seconds)
         }
+        Some("--host") => {
+            let first = arguments
+                .next()
+                .ok_or_else(|| DcError::InvalidInput("--host requires a password".into()))?;
+            let (address, password) = match arguments.next() {
+                Some(password) => (first, password),
+                None => ("0.0.0.0:22100".to_owned(), first),
+            };
+            if arguments.next().is_some() {
+                return Err(DcError::InvalidInput(usage().into()));
+            }
+            run_network_host(&address, &password)
+        }
+        Some("--connect") => {
+            let address = arguments
+                .next()
+                .ok_or_else(|| DcError::InvalidInput("--connect requires an address".into()))?;
+            let password = arguments
+                .next()
+                .ok_or_else(|| DcError::InvalidInput("--connect requires a password".into()))?;
+            if arguments.next().is_some() {
+                return Err(DcError::InvalidInput(usage().into()));
+            }
+            run_network_viewer(&address, &password)
+        }
         Some(argument) => Err(DcError::InvalidInput(format!(
             "unknown argument {argument}; {}",
             usage()
@@ -98,7 +128,115 @@ where
 }
 
 const fn usage() -> &'static str {
-    "usage: direct-computing [--loopback [frame-count] | --window-test [duration-seconds] | --capture-test [frame-count] [display-index] [output.bmp] | --preview [display-index] [duration-seconds]]"
+    "usage: direct-computing [--host [addr] <password> | --connect <addr> <password> | --loopback [frame-count] | --window-test [duration-seconds] | --capture-test [frame-count] [display-index] [output.bmp] | --preview [display-index] [duration-seconds]]"
+}
+
+fn run_network_host(address: &str, password: &str) -> Result<()> {
+    let address = address
+        .parse()
+        .map_err(|_| DcError::InvalidInput(format!("invalid host address: {address}")))?;
+    let verifier = PasswordVerifier::from_password(password)?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| DcError::Platform(error.to_string()))?
+        .block_on(async move {
+            let server = QuicServer::bind(address)?;
+            log(
+                LogLevel::Info,
+                "direct-computing::host",
+                &format!("listening on {}", server.local_addr()?),
+            );
+            let connection = server.accept().await?;
+            let mut control = connection.accept_stream().await?;
+            let permissions = Permissions {
+                view_desktop: true,
+                control_input: true,
+                ..Permissions::empty()
+            };
+            authenticate_server(
+                &mut control,
+                &verifier,
+                permissions,
+                Capabilities {
+                    desktop: true,
+                    ..Capabilities::default()
+                },
+            )
+            .await?;
+            control.send(&WireMessage::OpenDesktop).await?;
+            let mut video = connection.open_stream().await?;
+            send_desktop_frames(&mut video).await
+        })
+}
+
+#[cfg(target_os = "windows")]
+async fn send_desktop_frames(stream: &mut dc_transport::FramedStream) -> Result<()> {
+    let source = WindowsDesktopCapturer::new(0, 1_000)?;
+    send_frames_from(stream, source).await
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn send_desktop_frames(stream: &mut dc_transport::FramedStream) -> Result<()> {
+    let size = FrameSize::new(640, 360)?;
+    send_frames_from(stream, SyntheticFrameSource::new(size, 30)?).await
+}
+
+async fn send_frames_from<S>(stream: &mut dc_transport::FramedStream, mut source: S) -> Result<()>
+where
+    S: dc_media::FrameSource,
+{
+    let mut encoder = OpenH264Encoder::new(2_000_000, 30.0)?;
+    use dc_media::{EncodeOutcome, VideoEncoder};
+    loop {
+        let frame = source.capture()?;
+        if let EncodeOutcome::Packet(packet) = encoder.encode(frame)? {
+            stream.send(&packet_to_message(&packet)?).await?;
+        }
+        tokio::time::sleep(Duration::from_millis(33)).await;
+    }
+}
+
+fn run_network_viewer(address: &str, password: &str) -> Result<()> {
+    let address = address.to_owned();
+    let password = password.to_owned();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| DcError::Platform(error.to_string()))?
+        .block_on(async move {
+            let client = QuicClient::bind("0.0.0.0:0".parse().unwrap())?;
+            let connection = client
+                .connect(dc_transport::resolve_address(&address).await?)
+                .await?;
+            let mut control = connection.open_stream().await?;
+            let session = authenticate_client(
+                &mut control,
+                &password,
+                Capabilities {
+                    desktop: true,
+                    ..Capabilities::default()
+                },
+            )
+            .await?;
+            if !session.permissions.view_desktop {
+                return Err(DcError::Unsupported(
+                    "desktop viewing is not permitted".into(),
+                ));
+            }
+            let _ = control.receive().await?;
+            let mut video = connection.accept_stream().await?;
+            let mut decoder = OpenH264Decoder::new()?;
+            let mut sink = PreviewWindowSink::new("Direct Computing - Remote Desktop");
+            while sink.is_open() {
+                let message = video.receive().await?;
+                let packet = message_to_packet(message)?;
+                let frame = dc_media::VideoDecoder::decode(&mut decoder, packet)?;
+                dc_media::FrameSink::present(&mut sink, frame)?;
+                sink.pump_events();
+            }
+            Ok(())
+        })
 }
 
 fn run_window_test(duration_seconds: u64) -> Result<()> {
