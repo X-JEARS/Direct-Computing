@@ -3,8 +3,8 @@
 Direct Computing is an early-stage, open-source remote desktop, file transfer, and remote
 terminal project for direct connections over LAN, IPv6, or VPN networks.
 
-The project is currently at **stage 0: workspace initialization**. It intentionally does not
-include NAT traversal, a central account service, or a relay service.
+The project is currently in **stage 1: local media loopback**. It intentionally does not include
+NAT traversal, a central account service, or a relay service.
 
 ## Workspace
 
@@ -31,6 +31,12 @@ Run the bootstrap binaries with:
 ```sh
 cargo run -p direct-computing
 cargo run -p dc-cli
+```
+
+Run the synthetic H.264 encode/decode loopback prototype with:
+
+```sh
+cargo run -p direct-computing -- --loopback 30
 ```
 
 See [`docs/DIRECT_COMPUTING_DEVELOPMENT_PLAN.md`](docs/DIRECT_COMPUTING_DEVELOPMENT_PLAN.md)

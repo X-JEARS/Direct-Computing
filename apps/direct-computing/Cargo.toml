@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 dc-common = { path = "../../crates/dc-common" }
+dc-media = { path = "../../crates/dc-media" }
 dc-protocol = { path = "../../crates/dc-protocol" }
 
 [lints]

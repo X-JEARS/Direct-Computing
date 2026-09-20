@@ -5,6 +5,7 @@ use std::fmt;
 pub enum DcError {
     InvalidInput(String),
     Unsupported(String),
+    Codec(String),
     Io(std::io::Error),
 }
 
@@ -13,6 +14,7 @@ impl fmt::Display for DcError {
         match self {
             Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
             Self::Unsupported(message) => write!(f, "unsupported: {message}"),
+            Self::Codec(message) => write!(f, "codec error: {message}"),
             Self::Io(error) => write!(f, "I/O error: {error}"),
         }
     }
@@ -22,7 +24,7 @@ impl std::error::Error for DcError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::InvalidInput(_) | Self::Unsupported(_) => None,
+            Self::InvalidInput(_) | Self::Unsupported(_) | Self::Codec(_) => None,
         }
     }
 }

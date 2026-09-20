@@ -6,5 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 description = "Platform adapters for Direct Computing"
 
+[dependencies]
+dc-media = { path = "../dc-media" }
+
 [lints]
 workspace = true
