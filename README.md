@@ -46,8 +46,9 @@ Windows capture adapter on Windows and a synthetic source elsewhere; mouse/keybo
 certificate TOFU are still tracked as stage 2 follow-up work.
 
 Stage 3 now includes bounded file manifests, fixed-size chunks, SHA-256 checksums, resume-offset
-validation, safe destination paths, and `FileOffer`/`FileChunk`/`FileAck` protocol messages. The
-network file-transfer service and CLI are the next integration tasks.
+validation, safe destination paths, `FileOffer`/`FileChunk`/`FileAck` protocol messages, and a
+dedicated QUIC file-stream sender/receiver with temporary-file atomic delivery. The Host/Viewer
+file-transfer CLI and persistent resume state are the next integration tasks.
 
 Run the synthetic H.264 encode/decode loopback prototype with:
 

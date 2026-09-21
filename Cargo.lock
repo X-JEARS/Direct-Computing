@@ -189,7 +189,9 @@ version = "0.1.0"
 dependencies = [
  "dc-common",
  "dc-protocol",
+ "dc-transport",
  "sha2",
+ "tokio",
 ]
 
 [[package]]
