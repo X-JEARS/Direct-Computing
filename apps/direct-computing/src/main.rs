@@ -289,18 +289,38 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
             let mut video = connection.accept_stream().await?;
             let mut decoder = OpenH264Decoder::new()?;
             let mut sink = PreviewWindowSink::new("Direct Computing - Remote Desktop");
-            while sink.is_open() {
-                let message = video.receive().await?;
-                let packet = message_to_packet(message)?;
-                let width = packet.source_layout().size().width();
-                let height = packet.source_layout().size().height();
-                let frame = dc_media::VideoDecoder::decode(&mut decoder, packet)?;
-                dc_media::FrameSink::present(&mut sink, frame)?;
-                sink.pump_events();
-                for event in sink.drain_input_events() {
-                    validate_input(&event, width, height)?;
-                    control.send(&WireMessage::Input(event)).await?;
+            let mut desktop_size = None;
+            // Keep only a tiny decode queue.  An unbounded queue turns a slow
+            // decoder into steadily increasing end-to-end latency.
+            let (video_tx, mut video_rx) = tokio::sync::mpsc::channel(2);
+            tokio::spawn(async move {
+                loop {
+                    let result = video.receive().await;
+                    let done = result.is_err();
+                    if video_tx.send(result).await.is_err() || done {
+                        break;
+                    }
                 }
+            });
+            while sink.is_open() {
+                if let Ok(message) = video_rx.try_recv() {
+                    let message = message?;
+                    let packet = message_to_packet(message)?;
+                    desktop_size = Some((
+                        packet.source_layout().size().width(),
+                        packet.source_layout().size().height(),
+                    ));
+                    let frame = dc_media::VideoDecoder::decode(&mut decoder, packet)?;
+                    dc_media::FrameSink::present(&mut sink, frame)?;
+                }
+                sink.pump_events();
+                if let Some((width, height)) = desktop_size {
+                    for event in sink.drain_input_events() {
+                        validate_input(&event, width, height)?;
+                        control.send(&WireMessage::Input(event)).await?;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(4)).await;
             }
             let _ = control.send(&WireMessage::Close).await;
             Ok(())

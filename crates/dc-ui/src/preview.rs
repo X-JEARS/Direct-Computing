@@ -11,6 +11,7 @@ pub struct PreviewWindowSink {
     base_title: String,
     window: Option<Window>,
     pixels: Vec<u32>,
+    frame_size: Option<(usize, usize)>,
     last_pointer: Option<(i32, i32, u8)>,
 }
 
@@ -20,6 +21,7 @@ impl PreviewWindowSink {
             base_title: title.into(),
             window: None,
             pixels: Vec::new(),
+            frame_size: None,
             last_pointer: None,
         }
     }
@@ -44,11 +46,26 @@ impl PreviewWindowSink {
             return Vec::new();
         };
         let mut events = Vec::new();
-        if let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Clamp) {
+        if let Some((mouse_x, mouse_y)) = window.get_unscaled_mouse_pos(MouseMode::Clamp) {
+            let (window_width, window_height) = window.get_size();
+            let (frame_width, frame_height) = self
+                .frame_size
+                .unwrap_or((window_width.max(1), window_height.max(1)));
+            // minifb reports the pointer in the window's client area.  The
+            // image is stretched to that area, so map it back to decoded
+            // frame pixels instead of treating client pixels as source pixels.
+            let (x, y) = map_pointer_to_frame(
+                mouse_x,
+                mouse_y,
+                window_width,
+                window_height,
+                frame_width,
+                frame_height,
+            );
             let buttons = u8::from(window.get_mouse_down(MouseButton::Left))
                 | (u8::from(window.get_mouse_down(MouseButton::Right)) << 1)
                 | (u8::from(window.get_mouse_down(MouseButton::Middle)) << 2);
-            let pointer = (x.round() as i32, y.round() as i32, buttons);
+            let pointer = (x, y, buttons);
             if self.last_pointer != Some(pointer) {
                 events.push(InputEvent::Pointer {
                     x: pointer.0,
@@ -102,12 +119,30 @@ impl PreviewWindowSink {
     }
 }
 
+fn map_pointer_to_frame(
+    mouse_x: f32,
+    mouse_y: f32,
+    window_width: usize,
+    window_height: usize,
+    frame_width: usize,
+    frame_height: usize,
+) -> (i32, i32) {
+    let x = (mouse_x * frame_width as f32 / window_width.max(1) as f32)
+        .floor()
+        .clamp(0.0, frame_width.saturating_sub(1) as f32) as i32;
+    let y = (mouse_y * frame_height as f32 / window_height.max(1) as f32)
+        .floor()
+        .clamp(0.0, frame_height.saturating_sub(1) as f32) as i32;
+    (x, y)
+}
+
 impl FrameSink for PreviewWindowSink {
     fn present(&mut self, frame: VideoFrame) -> Result<()> {
         let layout = frame.layout();
         let width = layout.size().width() as usize;
         let height = layout.size().height() as usize;
         self.ensure_window(width, height)?;
+        self.frame_size = Some((width, height));
         convert_to_minifb(&frame, &mut self.pixels)?;
         self.window
             .as_mut()
@@ -198,5 +233,17 @@ mod tests {
         let mut output = Vec::new();
         convert_to_minifb(&frame, &mut output).unwrap();
         assert_eq!(output, vec![0x00112233, 0x00aabbcc]);
+    }
+
+    #[test]
+    fn maps_scaled_window_pointer_to_frame_pixels() {
+        assert_eq!(
+            map_pointer_to_frame(320.0, 180.0, 640, 360, 1_280, 720),
+            (640, 360)
+        );
+        assert_eq!(
+            map_pointer_to_frame(999.0, 999.0, 640, 360, 1_280, 720),
+            (1_279, 719)
+        );
     }
 }

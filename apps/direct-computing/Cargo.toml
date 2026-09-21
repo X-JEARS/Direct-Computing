@@ -14,7 +14,7 @@ dc-protocol = { path = "../../crates/dc-protocol" }
 dc-session = { path = "../../crates/dc-session" }
 dc-transport = { path = "../../crates/dc-transport" }
 dc-ui = { path = "../../crates/dc-ui" }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 
 [target.'cfg(windows)'.dependencies]
 dc-platform = { path = "../../crates/dc-platform" }
