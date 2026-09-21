@@ -41,6 +41,7 @@ impl Permissions {
     pub const fn to_capabilities(self) -> Capabilities {
         Capabilities {
             desktop: self.view_desktop,
+            control_input: self.control_input,
             terminal: self.open_terminal,
             command_execution: self.execute_command,
             file_transfer: self.transfer_files,

@@ -71,7 +71,7 @@ pub async fn authenticate_client(
         WireMessage::Authenticated { permissions } => Ok(AuthenticatedSession {
             permissions: Permissions {
                 view_desktop: permissions.desktop,
-                control_input: permissions.desktop,
+                control_input: permissions.control_input,
                 open_terminal: permissions.terminal,
                 execute_command: permissions.command_execution,
                 transfer_files: permissions.file_transfer,

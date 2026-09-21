@@ -208,6 +208,7 @@ version = "0.1.0"
 dependencies = [
  "dc-common",
  "dc-media",
+ "dc-protocol",
  "windows",
 ]
 
@@ -245,6 +246,7 @@ dependencies = [
  "quinn",
  "rcgen",
  "rustls",
+ "sha2",
  "tokio",
 ]
 
@@ -254,6 +256,8 @@ version = "0.1.0"
 dependencies = [
  "dc-common",
  "dc-media",
+ "dc-platform",
+ "dc-protocol",
  "minifb",
 ]
 

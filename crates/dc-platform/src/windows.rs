@@ -1,3 +1,4 @@
+use crate::InputInjector;
 use ::windows::core::Interface;
 use ::windows::Win32::Foundation::HMODULE;
 use ::windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -13,8 +14,16 @@ use ::windows::Win32::Graphics::Dxgi::{
     IDXGIAdapter, IDXGIDevice, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource,
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
+use ::windows::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEINPUT,
+};
+use ::windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 use dc_common::{DcError, Result};
 use dc_media::{FrameLayout, FrameSize, FrameSource, PixelFormat, VideoFrame};
+use dc_protocol::InputEvent;
 use std::time::Instant;
 
 pub struct WindowsDesktopCapturer {
@@ -142,6 +151,134 @@ impl FrameSource for WindowsDesktopCapturer {
         let sequence = self.sequence;
         self.sequence = self.sequence.wrapping_add(1);
         VideoFrame::new(sequence, self.started_at.elapsed(), layout, data)
+    }
+}
+
+/// Windows desktop input adapter backed by User32 `SendInput`.
+/// Pointer coordinates use physical desktop pixels; mouse button bits are
+/// left=1, right=2, middle=4.
+pub struct WindowsInputInjector {
+    buttons: u8,
+}
+
+impl WindowsInputInjector {
+    pub const fn new() -> Self {
+        Self { buttons: 0 }
+    }
+
+    fn send(input: &INPUT) -> Result<()> {
+        let sent = unsafe {
+            SendInput(
+                std::slice::from_ref(input),
+                std::mem::size_of::<INPUT>() as i32,
+            )
+        };
+        if sent != 1 {
+            return Err(DcError::Platform(
+                "SendInput did not inject the event".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for WindowsInputInjector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InputInjector for WindowsInputInjector {
+    fn inject(&mut self, event: &InputEvent) -> Result<()> {
+        match event {
+            InputEvent::Pointer { x, y, buttons } => {
+                if *x < 0 || *y < 0 {
+                    return Err(DcError::InvalidInput(
+                        "pointer coordinates must be non-negative".into(),
+                    ));
+                }
+                let screen_width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+                let screen_height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+                if screen_width <= 0
+                    || screen_height <= 0
+                    || *x >= screen_width
+                    || *y >= screen_height
+                {
+                    return Err(DcError::InvalidInput(
+                        "pointer coordinates are outside the primary desktop".into(),
+                    ));
+                }
+                let normalized_x =
+                    ((*x as i64 * 65_535) / i64::from((screen_width - 1).max(1))) as i32;
+                let normalized_y =
+                    ((*y as i64 * 65_535) / i64::from((screen_height - 1).max(1))) as i32;
+                let pointer = INPUT {
+                    r#type: INPUT_MOUSE,
+                    Anonymous: INPUT_0 {
+                        mi: MOUSEINPUT {
+                            dx: normalized_x,
+                            dy: normalized_y,
+                            mouseData: 0,
+                            dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                Self::send(&pointer)?;
+                let changed = self.buttons ^ *buttons;
+                for (mask, down, up) in [
+                    (1, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
+                    (2, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
+                    (4, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+                ] {
+                    if changed & mask != 0 {
+                        let button = INPUT {
+                            r#type: INPUT_MOUSE,
+                            Anonymous: INPUT_0 {
+                                mi: MOUSEINPUT {
+                                    dx: 0,
+                                    dy: 0,
+                                    mouseData: 0,
+                                    dwFlags: if *buttons & mask != 0 { down } else { up },
+                                    time: 0,
+                                    dwExtraInfo: 0,
+                                },
+                            },
+                        };
+                        Self::send(&button)?;
+                    }
+                }
+                self.buttons = *buttons & 0x07;
+                Ok(())
+            }
+            InputEvent::Key { code, pressed } => {
+                if *code > u16::MAX as u32 {
+                    return Err(DcError::InvalidInput(
+                        "virtual key code is out of range".into(),
+                    ));
+                }
+                let key = INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: ::windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(
+                                *code as u16,
+                            ),
+                            wScan: 0,
+                            dwFlags: if *pressed {
+                                KEYBD_EVENT_FLAGS(0)
+                            } else {
+                                KEYEVENTF_KEYUP
+                            },
+                            time: 0,
+                            dwExtraInfo: 0,
+                        },
+                    },
+                };
+                Self::send(&key)
+            }
+        }
     }
 }
 

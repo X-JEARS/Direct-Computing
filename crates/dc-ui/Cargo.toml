@@ -9,6 +9,8 @@ description = "Shared user-interface layer for Direct Computing"
 [dependencies]
 dc-common = { path = "../dc-common" }
 dc-media = { path = "../dc-media", default-features = false }
+dc-protocol = { path = "../dc-protocol" }
+dc-platform = { path = "../dc-platform" }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 minifb = { version = "0.28.0", default-features = false }

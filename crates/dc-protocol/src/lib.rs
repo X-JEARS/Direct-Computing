@@ -31,6 +31,7 @@ pub enum ServiceKind {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Capabilities {
     pub desktop: bool,
+    pub control_input: bool,
     pub terminal: bool,
     pub command_execution: bool,
     pub file_transfer: bool,
@@ -333,7 +334,8 @@ fn put_capabilities(out: &mut Vec<u8>, value: Capabilities) {
             | (u8::from(value.command_execution) << 2)
             | (u8::from(value.file_transfer) << 3)
             | (u8::from(value.clipboard) << 4)
-            | (u8::from(value.ssh_compatibility) << 5),
+            | (u8::from(value.ssh_compatibility) << 5)
+            | (u8::from(value.control_input) << 6),
     );
 }
 fn put_bytes(out: &mut Vec<u8>, value: &[u8]) -> dc_common::Result<()> {
@@ -397,6 +399,7 @@ impl<'a> Reader<'a> {
         let flags = self.u8()?;
         Ok(Capabilities {
             desktop: flags & 1 != 0,
+            control_input: flags & 64 != 0,
             terminal: flags & 2 != 0,
             command_execution: flags & 4 != 0,
             file_transfer: flags & 8 != 0,
@@ -470,6 +473,21 @@ mod tests {
             offset: 256,
             data: vec![1, 2, 3],
             sha256: [9; 32],
+        };
+        assert_eq!(
+            WireMessage::decode(&message.encode().unwrap()).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn capability_round_trip_preserves_control_permission() {
+        let message = WireMessage::Authenticated {
+            permissions: Capabilities {
+                desktop: true,
+                control_input: true,
+                ..Capabilities::default()
+            },
         };
         assert_eq!(
             WireMessage::decode(&message.encode().unwrap()).unwrap(),

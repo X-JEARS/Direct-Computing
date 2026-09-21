@@ -9,6 +9,7 @@ description = "Platform adapters for Direct Computing"
 [dependencies]
 dc-common = { path = "../dc-common" }
 dc-media = { path = "../dc-media", default-features = false }
+dc-protocol = { path = "../dc-protocol" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
@@ -18,6 +19,8 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # FFI is isolated in this crate; all other workspace crates continue to forbid unsafe code.

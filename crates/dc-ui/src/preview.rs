@@ -1,6 +1,8 @@
 use dc_common::{DcError, Result};
 use dc_media::{FrameSink, PixelFormat, VideoFrame};
-use minifb::{Key, ScaleMode, Window, WindowOptions};
+use dc_platform::InputEventSource;
+use dc_protocol::InputEvent;
+use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 
 const MAX_INITIAL_WIDTH: usize = 1_280;
 const MAX_INITIAL_HEIGHT: usize = 720;
@@ -9,6 +11,7 @@ pub struct PreviewWindowSink {
     base_title: String,
     window: Option<Window>,
     pixels: Vec<u32>,
+    last_pointer: Option<(i32, i32, u8)>,
 }
 
 impl PreviewWindowSink {
@@ -17,6 +20,7 @@ impl PreviewWindowSink {
             base_title: title.into(),
             window: None,
             pixels: Vec::new(),
+            last_pointer: None,
         }
     }
 
@@ -30,6 +34,43 @@ impl PreviewWindowSink {
         if let Some(window) = &mut self.window {
             window.update();
         }
+    }
+
+    /// Drain local keyboard and pointer events observed by the preview window.
+    /// Coordinates are reported in decoded-frame pixels, independent of the
+    /// window's current scaling.
+    pub fn drain_input_events(&mut self) -> Vec<InputEvent> {
+        let Some(window) = &mut self.window else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        if let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Clamp) {
+            let buttons = u8::from(window.get_mouse_down(MouseButton::Left))
+                | (u8::from(window.get_mouse_down(MouseButton::Right)) << 1)
+                | (u8::from(window.get_mouse_down(MouseButton::Middle)) << 2);
+            let pointer = (x.round() as i32, y.round() as i32, buttons);
+            if self.last_pointer != Some(pointer) {
+                events.push(InputEvent::Pointer {
+                    x: pointer.0,
+                    y: pointer.1,
+                    buttons,
+                });
+                self.last_pointer = Some(pointer);
+            }
+        }
+        for key in window.get_keys_pressed(KeyRepeat::No) {
+            events.push(InputEvent::Key {
+                code: key as u32,
+                pressed: true,
+            });
+        }
+        for key in window.get_keys_released() {
+            events.push(InputEvent::Key {
+                code: key as u32,
+                pressed: false,
+            });
+        }
+        events
     }
 
     pub fn set_status(&mut self, status: &str) {
@@ -73,6 +114,12 @@ impl FrameSink for PreviewWindowSink {
             .ok_or_else(|| DcError::Platform("preview window was not created".into()))?
             .update_with_buffer(&self.pixels, width, height)
             .map_err(|error| DcError::Platform(format!("update preview window: {error}")))
+    }
+}
+
+impl InputEventSource for PreviewWindowSink {
+    fn drain_input_events(&mut self) -> Vec<InputEvent> {
+        PreviewWindowSink::drain_input_events(self)
     }
 }
 

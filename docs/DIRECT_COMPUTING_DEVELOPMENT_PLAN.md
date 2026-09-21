@@ -578,13 +578,19 @@ Wayland 放在 X11 之后实现。
 - [x] 权限字段和桌面查看权限门控
 - [x] H.264/Raw 视频包跨网络序列化与解码
 - [x] RTT/丢包/队列/编码耗时驱动的基础码率控制器
-- [ ] Windows SendInput 鼠标键盘注入和 GUI 事件采集
-- [ ] 证书指纹持久化与首次连接确认
+- [x] Windows SendInput 鼠标键盘注入和 GUI 事件采集
+- [x] 证书 SHA-256 指纹固定、TOFU pin store 与首次连接指纹提示
 - [ ] 真机 Windows ↔ Windows 长时间串流基准
 
+Windows Host → macOS Viewer 可以先作为跨平台集成测试：Windows 使用 DXGI 采集，macOS 使用
+通用 Viewer 窗口解码并回传输入。该测试不替代 Windows ↔ Windows 长时间基准；macOS Host
+原生屏幕采集仍属于后续跨平台阶段。
+
 当前可通过 `direct-computing --host [addr] <password>` 启动 Host，通过
-`direct-computing --connect <addr> <password>` 启动 Viewer；非 Windows Host 使用合成画面，
-Windows Host 使用阶段 1 的桌面采集器。鼠标键盘和证书 TOFU 将在阶段 2 的下一次迭代补齐。
+`direct-computing --connect <addr> <password> [cert-sha256]` 启动 Viewer；首次连接会显示
+服务端证书 SHA-256 指纹，后续把该值作为可选参数传入即可启用证书固定。非 Windows Host
+使用合成画面，Windows Host 使用阶段 1 的桌面采集器。Viewer 窗口产生的鼠标/键盘事件
+经过独立控制流发送，Host 仅在认证权限包含 `control_input` 时调用 Windows `SendInput`。
 
 阶段 2 本机验证记录（2026-09-21）：
 
@@ -596,8 +602,11 @@ Windows Host 使用阶段 1 的桌面采集器。鼠标键盘和证书 TOFU 将�
   随后正常清理进程。
 - 使用错误密码连接时，Host 记录 `authentication failed`，Viewer 收到连接关闭；认证拒绝路径
   符合预期。
-- 本记录验证的是本机进程间连接和协议路径，不替代 Windows ↔ Windows 长时间串流、真实窗口
-  交互、鼠标键盘注入和证书 TOFU 验证；这些项目仍保持未完成状态。
+- 本记录验证的是本机进程间连接和协议路径，不替代 Windows ↔ Windows 真机的交互和长时间
+  串流基准；该项仍保持未完成状态。
+- Windows Host → macOS Viewer 的操作步骤和验收项见
+  `docs/WINDOWS_MAC_STREAMING_TESTING.md`；尚未在真实双机环境执行，等待 Windows/macOS
+  设备测试结果回填。
 
 ### 阶段 3：文件传输和桌面优化
 

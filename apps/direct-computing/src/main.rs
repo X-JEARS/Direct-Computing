@@ -1,5 +1,6 @@
 use dc_auth::{PasswordVerifier, Permissions};
 use dc_common::{init_logging, log, DcError, LogLevel, Result};
+use dc_desktop::validate_input;
 use dc_desktop::{message_to_packet, packet_to_message};
 #[cfg(target_os = "windows")]
 use dc_media::{write_bmp, LastFrameSink};
@@ -9,10 +10,12 @@ use dc_media::{
 };
 #[cfg(target_os = "windows")]
 use dc_platform::WindowsDesktopCapturer;
+#[cfg(target_os = "windows")]
+use dc_platform::{InputInjector, WindowsInputInjector};
 use dc_protocol::PROTOCOL_VERSION;
 use dc_protocol::{Capabilities, WireMessage};
 use dc_session::{authenticate_client, authenticate_server};
-use dc_transport::{QuicClient, QuicServer};
+use dc_transport::{format_fingerprint, parse_fingerprint, QuicClient, QuicServer};
 use dc_ui::PreviewWindowSink;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -96,10 +99,11 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<()> {
             let password = arguments
                 .next()
                 .ok_or_else(|| DcError::InvalidInput("--connect requires a password".into()))?;
+            let fingerprint = arguments.next();
             if arguments.next().is_some() {
                 return Err(DcError::InvalidInput(usage().into()));
             }
-            run_network_viewer(&address, &password)
+            run_network_viewer(&address, &password, fingerprint.as_deref())
         }
         Some(argument) => Err(DcError::InvalidInput(format!(
             "unknown argument {argument}; {}",
@@ -128,7 +132,7 @@ where
 }
 
 const fn usage() -> &'static str {
-    "usage: direct-computing [--host [addr] <password> | --connect <addr> <password> | --loopback [frame-count] | --window-test [duration-seconds] | --capture-test [frame-count] [display-index] [output.bmp] | --preview [display-index] [duration-seconds]]"
+    "usage: direct-computing [--host [addr] <password> | --connect <addr> <password> [cert-sha256] | --loopback [frame-count] | --window-test [duration-seconds] | --capture-test [frame-count] [display-index] [output.bmp] | --preview [display-index] [duration-seconds]]"
 }
 
 fn run_network_host(address: &str, password: &str) -> Result<()> {
@@ -145,7 +149,11 @@ fn run_network_host(address: &str, password: &str) -> Result<()> {
             log(
                 LogLevel::Info,
                 "direct-computing::host",
-                &format!("listening on {}", server.local_addr()?),
+                &format!(
+                    "listening on {}; certificate sha256={}",
+                    server.local_addr()?,
+                    format_fingerprint(server.certificate_fingerprint())
+                ),
             );
             let connection = server.accept().await?;
             let mut control = connection.accept_stream().await?;
@@ -160,14 +168,51 @@ fn run_network_host(address: &str, password: &str) -> Result<()> {
                 permissions,
                 Capabilities {
                     desktop: true,
+                    control_input: true,
                     ..Capabilities::default()
                 },
             )
             .await?;
             control.send(&WireMessage::OpenDesktop).await?;
+            tokio::spawn(async move {
+                if let Err(error) = receive_host_input(&mut control).await {
+                    log(
+                        LogLevel::Warn,
+                        "direct-computing::host",
+                        &format!("input stream closed: {error}"),
+                    );
+                }
+            });
             let mut video = connection.open_stream().await?;
             send_desktop_frames(&mut video).await
         })
+}
+
+#[cfg(target_os = "windows")]
+async fn receive_host_input(stream: &mut dc_transport::FramedStream) -> Result<()> {
+    let mut injector = WindowsInputInjector::new();
+    loop {
+        match stream.receive().await? {
+            WireMessage::Input(event) => injector.inject(&event)?,
+            WireMessage::Close => return Ok(()),
+            _ => {}
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn receive_host_input(stream: &mut dc_transport::FramedStream) -> Result<()> {
+    loop {
+        match stream.receive().await? {
+            WireMessage::Input(_) => {
+                return Err(DcError::Unsupported(
+                    "remote input injection requires Windows Host".into(),
+                ));
+            }
+            WireMessage::Close => return Ok(()),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -197,7 +242,7 @@ where
     }
 }
 
-fn run_network_viewer(address: &str, password: &str) -> Result<()> {
+fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) -> Result<()> {
     let address = address.to_owned();
     let password = password.to_owned();
     tokio::runtime::Builder::new_multi_thread()
@@ -205,16 +250,32 @@ fn run_network_viewer(address: &str, password: &str) -> Result<()> {
         .build()
         .map_err(|error| DcError::Platform(error.to_string()))?
         .block_on(async move {
-            let client = QuicClient::bind("0.0.0.0:0".parse().unwrap())?;
-            let connection = client
-                .connect(dc_transport::resolve_address(&address).await?)
-                .await?;
+            let client_address = "0.0.0.0:0".parse().unwrap();
+            let client = match fingerprint {
+                Some(value) => QuicClient::bind_pinned(client_address, parse_fingerprint(value)?)?,
+                None => QuicClient::bind_tofu(client_address)?,
+            };
+            let connection = client.connect(dc_transport::resolve_address(&address).await?).await?;
+            if fingerprint.is_none() {
+                let observed = client.server_certificate_fingerprint().ok_or_else(|| {
+                    DcError::Platform("server certificate fingerprint was not observed".into())
+                })?;
+                log(
+                    LogLevel::Warn,
+                    "direct-computing::viewer",
+                    &format!(
+                        "first connection certificate sha256={}; reconnect with this fingerprint to pin it",
+                        format_fingerprint(observed)
+                    ),
+                );
+            }
             let mut control = connection.open_stream().await?;
             let session = authenticate_client(
                 &mut control,
                 &password,
                 Capabilities {
                     desktop: true,
+                    control_input: true,
                     ..Capabilities::default()
                 },
             )
@@ -231,10 +292,17 @@ fn run_network_viewer(address: &str, password: &str) -> Result<()> {
             while sink.is_open() {
                 let message = video.receive().await?;
                 let packet = message_to_packet(message)?;
+                let width = packet.source_layout().size().width();
+                let height = packet.source_layout().size().height();
                 let frame = dc_media::VideoDecoder::decode(&mut decoder, packet)?;
                 dc_media::FrameSink::present(&mut sink, frame)?;
                 sink.pump_events();
+                for event in sink.drain_input_events() {
+                    validate_input(&event, width, height)?;
+                    control.send(&WireMessage::Input(event)).await?;
+                }
             }
+            let _ = control.send(&WireMessage::Close).await;
             Ok(())
         })
 }

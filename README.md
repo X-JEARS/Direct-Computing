@@ -38,12 +38,16 @@ Start a local host and connect a viewer with an address and password:
 ```sh
 cargo run -p direct-computing -- --host 0.0.0.0:22100 '<password>'
 cargo run -p direct-computing -- --connect 192.168.1.20:22100 '<password>'
+# Confirm the first connection's printed fingerprint, then pin it on later connections:
+cargo run -p direct-computing -- --connect 192.168.1.20:22100 '<password>' '<cert-sha256>'
 ```
 
 The stage 2 path uses QUIC/TLS 1.3, protocol capability negotiation, Argon2id-derived challenge
 authentication, and H.264 desktop packets on independent streams. The current host uses the real
-Windows capture adapter on Windows and a synthetic source elsewhere; mouse/keyboard injection and
-certificate TOFU are still tracked as stage 2 follow-up work.
+Windows capture adapter on Windows and a synthetic source elsewhere. Viewer mouse/keyboard events
+travel over the authenticated control stream and are injected with Windows `SendInput`. First
+connections expose a SHA-256 certificate fingerprint and later connections can pin it with the
+optional argument; `dc-transport` also provides a confirmed, persistent TOFU pin store.
 
 Stage 3 now includes bounded file manifests, fixed-size chunks, SHA-256 checksums, resume-offset
 validation, safe destination paths, `FileOffer`/`FileChunk`/`FileAck` protocol messages, and a
@@ -81,6 +85,9 @@ timings. OpenH264 rate-control skips are reported and do not terminate the previ
 
 See [`docs/WINDOWS_CAPTURE_TESTING.md`](docs/WINDOWS_CAPTURE_TESTING.md) for prerequisites and the
 runtime test matrix.
+
+For the cross-platform Windows Host → macOS Viewer test procedure, see
+[`docs/WINDOWS_MAC_STREAMING_TESTING.md`](docs/WINDOWS_MAC_STREAMING_TESTING.md).
 
 See [`docs/DIRECT_COMPUTING_DEVELOPMENT_PLAN.md`](docs/DIRECT_COMPUTING_DEVELOPMENT_PLAN.md)
 for the complete roadmap.

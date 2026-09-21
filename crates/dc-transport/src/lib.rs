@@ -7,7 +7,15 @@ use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerCo
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionState {
@@ -33,6 +41,7 @@ pub async fn resolve_address(address: &str) -> Result<SocketAddr> {
 
 pub struct QuicServer {
     endpoint: Endpoint,
+    certificate_fingerprint: [u8; 32],
 }
 
 impl QuicServer {
@@ -41,6 +50,7 @@ impl QuicServer {
         let cert = rcgen::generate_simple_self_signed(vec!["direct-computing".to_owned()])
             .map_err(|error| DcError::Platform(format!("generate TLS certificate: {error}")))?;
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let certificate_fingerprint = fingerprint(cert_der.as_ref());
         let key_der = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
         let crypto = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -50,11 +60,19 @@ impl QuicServer {
             .map_err(|error| DcError::Platform(format!("configure QUIC TLS server: {error}")))?;
         let endpoint = Endpoint::server(ServerConfig::with_crypto(Arc::new(crypto)), address)
             .map_err(|error| DcError::Io(std::io::Error::other(error)))?;
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            certificate_fingerprint,
+        })
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.endpoint.local_addr().map_err(DcError::Io)
+    }
+
+    /// SHA-256 fingerprint of the self-signed certificate advertised by this endpoint.
+    pub const fn certificate_fingerprint(&self) -> [u8; 32] {
+        self.certificate_fingerprint
     }
 
     pub async fn accept(&self) -> Result<QuicConnection> {
@@ -73,20 +91,36 @@ impl QuicServer {
 
 pub struct QuicClient {
     endpoint: Endpoint,
+    verifier: Arc<PinningVerifier>,
 }
 
 impl QuicClient {
     pub fn bind(address: SocketAddr) -> Result<Self> {
+        Self::bind_with_verifier(address, Arc::new(PinningVerifier::accept_any()))
+    }
+
+    /// Bind a client that accepts only the supplied SHA-256 certificate fingerprint.
+    pub fn bind_pinned(address: SocketAddr, expected: [u8; 32]) -> Result<Self> {
+        Self::bind_with_verifier(address, Arc::new(PinningVerifier::pinned(expected)))
+    }
+
+    /// Bind a TOFU client. The first certificate is exposed through
+    /// [`Self::server_certificate_fingerprint`] for explicit confirmation and storage.
+    pub fn bind_tofu(address: SocketAddr) -> Result<Self> {
+        Self::bind_with_verifier(address, Arc::new(PinningVerifier::tofu()))
+    }
+
+    fn bind_with_verifier(address: SocketAddr, verifier: Arc<PinningVerifier>) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut endpoint = Endpoint::client(address).map_err(DcError::Io)?;
         let crypto = rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
+            .with_custom_certificate_verifier(verifier.clone())
             .with_no_client_auth();
         let crypto = QuicClientConfig::try_from(crypto)
             .map_err(|error| DcError::Platform(format!("configure QUIC TLS client: {error}")))?;
         endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
-        Ok(Self { endpoint })
+        Ok(Self { endpoint, verifier })
     }
 
     pub async fn connect(&self, address: SocketAddr) -> Result<QuicConnection> {
@@ -98,6 +132,10 @@ impl QuicClient {
             .await
             .map_err(|error| DcError::Platform(format!("connect QUIC: {error}")))?;
         Ok(QuicConnection { connection })
+    }
+
+    pub fn server_certificate_fingerprint(&self) -> Option<[u8; 32]> {
+        self.verifier.seen.lock().ok().and_then(|value| *value)
     }
 }
 
@@ -177,17 +215,58 @@ fn map_quic_io(error: impl std::fmt::Display) -> DcError {
 }
 
 #[derive(Debug)]
-struct AcceptAnyCertificate;
+struct PinningVerifier {
+    expected: Option<[u8; 32]>,
+    tofu: bool,
+    seen: Mutex<Option<[u8; 32]>>,
+}
 
-impl ServerCertVerifier for AcceptAnyCertificate {
+impl PinningVerifier {
+    fn accept_any() -> Self {
+        Self {
+            expected: None,
+            tofu: false,
+            seen: Mutex::new(None),
+        }
+    }
+    fn pinned(expected: [u8; 32]) -> Self {
+        Self {
+            expected: Some(expected),
+            tofu: false,
+            seen: Mutex::new(None),
+        }
+    }
+    fn tofu() -> Self {
+        Self {
+            expected: None,
+            tofu: true,
+            seen: Mutex::new(None),
+        }
+    }
+}
+
+impl ServerCertVerifier for PinningVerifier {
     fn verify_server_cert(
         &self,
-        _: &CertificateDer<'_>,
+        end_entity: &CertificateDer<'_>,
         _: &[CertificateDer<'_>],
         _: &ServerName<'_>,
         _: &[u8],
         _: UnixTime,
     ) -> std::result::Result<ServerCertVerified, TlsError> {
+        let actual = fingerprint(end_entity.as_ref());
+        if let Some(expected) = self.expected {
+            if actual != expected {
+                return Err(TlsError::General(
+                    "server certificate fingerprint mismatch".into(),
+                ));
+            }
+        } else if !self.tofu && self.expected.is_none() {
+            // Legacy bind() keeps the original accept-any behavior.
+        }
+        if let Ok(mut seen) = self.seen.lock() {
+            *seen = Some(actual);
+        }
         Ok(ServerCertVerified::assertion())
     }
     fn verify_tls12_signature(
@@ -215,9 +294,110 @@ impl ServerCertVerifier for AcceptAnyCertificate {
     }
 }
 
+fn fingerprint(certificate: &[u8]) -> [u8; 32] {
+    Sha256::digest(certificate).into()
+}
+
+/// A small, line-oriented TOFU pin database. New pins are never written unless
+/// `confirm_new` is true, allowing a CLI to display the fingerprint and ask the
+/// user before trusting a first connection.
+#[derive(Clone, Debug)]
+pub struct CertificatePinStore {
+    path: PathBuf,
+    pins: BTreeMap<String, [u8; 32]>,
+}
+
+impl CertificatePinStore {
+    pub fn load(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let mut pins = BTreeMap::new();
+        if path.exists() {
+            let text = fs::read_to_string(&path).map_err(DcError::Io)?;
+            for (line_no, line) in text.lines().enumerate() {
+                if line.trim().is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let (endpoint, value) = line.split_once(' ').ok_or_else(|| {
+                    DcError::InvalidInput(format!(
+                        "invalid certificate pin at line {}",
+                        line_no + 1
+                    ))
+                })?;
+                let bytes = parse_fingerprint(value)?;
+                pins.insert(endpoint.to_owned(), bytes);
+            }
+        }
+        Ok(Self { path, pins })
+    }
+
+    pub fn fingerprint(&self, endpoint: &str) -> Option<[u8; 32]> {
+        self.pins.get(endpoint).copied()
+    }
+
+    pub fn verify_or_record(
+        &mut self,
+        endpoint: &str,
+        actual: [u8; 32],
+        confirm_new: bool,
+    ) -> Result<()> {
+        match self.pins.get(endpoint).copied() {
+            Some(expected) if expected == actual => Ok(()),
+            Some(_) => Err(DcError::InvalidInput(format!(
+                "certificate fingerprint changed for {endpoint}"
+            ))),
+            None if confirm_new => {
+                self.pins.insert(endpoint.to_owned(), actual);
+                self.save()
+            }
+            None => Err(DcError::InvalidInput(format!(
+                "untrusted new certificate for {endpoint}; fingerprint={}",
+                format_fingerprint(actual)
+            ))),
+        }
+    }
+
+    pub fn save(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(DcError::Io)?;
+            }
+        }
+        let mut text = String::new();
+        for (endpoint, fingerprint) in &self.pins {
+            text.push_str(endpoint);
+            text.push(' ');
+            text.push_str(&format_fingerprint(*fingerprint));
+            text.push('\n');
+        }
+        let temporary = self.path.with_extension("tmp");
+        fs::write(&temporary, text).map_err(DcError::Io)?;
+        fs::rename(temporary, &self.path).map_err(DcError::Io)
+    }
+}
+
+pub fn format_fingerprint(value: [u8; 32]) -> String {
+    value.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub fn parse_fingerprint(value: &str) -> Result<[u8; 32]> {
+    if value.len() != 64 {
+        return Err(DcError::InvalidInput(
+            "certificate fingerprint must contain 64 hex characters".into(),
+        ));
+    }
+    let mut output = [0; 32];
+    for (index, byte) in output.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).map_err(|_| {
+            DcError::InvalidInput("certificate fingerprint is not valid hex".into())
+        })?;
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn server_binds_an_ephemeral_local_port() {
@@ -229,5 +409,39 @@ mod tests {
                 let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
                 assert_ne!(server.local_addr().unwrap().port(), 0);
             });
+    }
+
+    #[test]
+    fn certificate_pin_store_requires_confirmation_for_new_hosts() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("direct-computing-pins-{unique}"));
+        let mut store = CertificatePinStore::load(&path).unwrap();
+        let fingerprint = [0xabu8; 32];
+        assert!(store
+            .verify_or_record("127.0.0.1:22100", fingerprint, false)
+            .is_err());
+        store
+            .verify_or_record("127.0.0.1:22100", fingerprint, true)
+            .unwrap();
+        let loaded = CertificatePinStore::load(&path).unwrap();
+        assert_eq!(loaded.fingerprint("127.0.0.1:22100"), Some(fingerprint));
+        assert!(loaded
+            .clone()
+            .verify_or_record("127.0.0.1:22100", [0x11; 32], false)
+            .is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn fingerprint_format_is_stable() {
+        let value = [0xabu8; 32];
+        assert_eq!(format_fingerprint(value).len(), 64);
+        assert_eq!(
+            parse_fingerprint(&format_fingerprint(value)).unwrap(),
+            value
+        );
     }
 }
