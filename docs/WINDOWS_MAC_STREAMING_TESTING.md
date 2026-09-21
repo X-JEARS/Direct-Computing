@@ -29,6 +29,7 @@ At startup, confirm that the Viewer reports:
 
 ```text
 decoder backend=apple-videotoolbox-h264 hardware=true zero_copy=false low_latency=true
+present backend=metal
 ```
 
 If VideoToolbox cannot accept or decode the stream, the Viewer logs the failure and switches to
@@ -45,6 +46,9 @@ cargo run -p direct-computing -- --connect <windows-ip>:22100 '<password>' '<cer
 
 - Authentication succeeds with the correct password and fails with an incorrect password.
 - The macOS window shows the Windows desktop with correct orientation and colors.
+- On macOS, the Viewer requests VideoToolbox BGRA output and reports the Metal presentation
+  backend; `zero_copy=false` is expected because the current cross-platform frame model still
+  copies the CVPixelBuffer before the Metal upload.
 - The stream remains active for at least 15 minutes without QUIC, decode, or application errors.
 - Moving the mouse and pressing/releasing keys in the macOS Viewer produces the expected input on
   Windows. Verify only on a disposable test desktop; remote input is intentionally enabled by the

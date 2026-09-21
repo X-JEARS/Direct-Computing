@@ -26,6 +26,23 @@ impl PreviewWindowSink {
         }
     }
 
+    /// Name of the native presentation backend used by the preview window.
+    ///
+    /// minifb's macOS backend uploads the frame into a Metal texture and
+    /// presents it through a CAMetalLayer. Keeping this information beside the
+    /// sink makes the Viewer startup diagnostics explicit instead of implying
+    /// that VideoToolbox hardware decode alone covers presentation.
+    pub const fn render_backend() -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            "metal"
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            "minifb"
+        }
+    }
+
     pub fn is_open(&self) -> bool {
         self.window
             .as_ref()

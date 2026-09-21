@@ -2,8 +2,13 @@
 //!
 //! The decoder accepts Annex-B H.264 packets, converts them to the AVCC sample
 //! layout expected by VideoToolbox, and copies the decoded CVPixelBuffer into
-//! the existing `VideoFrame` model. The copy keeps the cross-platform media
-//! API simple; a future Metal-backed sink can consume the pixel buffer directly.
+//! the existing `VideoFrame` model. BGRA buffers are preserved in their native
+//! packed layout so the macOS Metal-backed window can upload them without a
+//! full-frame RGB channel-swizzle pass.
+
+// Clippy 1.98 reports the separate framework link attributes below as
+// duplicates even though each names a different Apple framework.
+#![allow(clippy::duplicated_attributes)]
 
 use dc_common::{DcError, Result};
 use dc_media::{
@@ -15,6 +20,9 @@ use std::ptr;
 
 type OSStatus = i32;
 type CFAllocatorRef = *const c_void;
+type CFStringRef = *const c_void;
+type CFDictionaryRef = *const c_void;
+type CFNumberRef = *const c_void;
 type CMBlockBufferRef = *mut c_void;
 type CMSampleBufferRef = *mut c_void;
 type CMFormatDescriptionRef = *mut c_void;
@@ -107,6 +115,21 @@ extern "C" {
         sample_buffer_out: *mut CMSampleBufferRef,
     ) -> OSStatus;
     fn CFRelease(value: *const c_void);
+    fn CFNumberCreate(
+        allocator: CFAllocatorRef,
+        number_type: isize,
+        value_ptr: *const c_void,
+    ) -> CFNumberRef;
+    fn CFDictionaryCreate(
+        allocator: CFAllocatorRef,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        count: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> CFDictionaryRef;
+
+    static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
 
     fn VTDecompressionSessionCreate(
         allocator: CFAllocatorRef,
@@ -245,17 +268,52 @@ impl VideoToolboxH264Decoder {
             callback: Some(output_callback),
             ref_con: ptr::null_mut(),
         };
+        // Ask VideoToolbox for a packed BGRA surface.  This is the format
+        // consumed by the macOS Metal presentation path, and avoids forcing
+        // the decoder callback through a CPU NV12 colour conversion.
+        let pixel_format = KCV_PIXEL_FORMAT_TYPE_32_BGRA;
+        let pixel_format_number = unsafe {
+            CFNumberCreate(
+                ptr::null(),
+                3, // kCFNumberSInt32Type
+                (&pixel_format as *const u32).cast(),
+            )
+        };
+        if pixel_format_number.is_null() {
+            return Err(DcError::Platform(
+                "create VideoToolbox pixel-format attribute failed".into(),
+            ));
+        }
+        let keys = [unsafe { kCVPixelBufferPixelFormatTypeKey }];
+        let values = [pixel_format_number];
+        let image_buffer_attributes = unsafe {
+            CFDictionaryCreate(
+                ptr::null(),
+                keys.as_ptr().cast(),
+                values.as_ptr().cast(),
+                1,
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        unsafe { CFRelease(pixel_format_number) };
+        if image_buffer_attributes.is_null() {
+            return Err(DcError::Platform(
+                "create VideoToolbox image-buffer attributes failed".into(),
+            ));
+        }
         let mut session = ptr::null_mut();
         let status = unsafe {
             VTDecompressionSessionCreate(
                 ptr::null(),
                 self.format_description,
                 ptr::null(),
-                ptr::null(),
+                image_buffer_attributes,
                 &callback,
                 &mut session,
             )
         };
+        unsafe { CFRelease(image_buffer_attributes) };
         if status != NO_ERR {
             return Err(os_error(
                 "create VideoToolbox decompression session",
@@ -401,21 +459,30 @@ fn copy_pixel_buffer(
         let height = unsafe { CVPixelBufferGetHeight(pixel_buffer) } as u32;
         let size = dc_media::FrameSize::new(width, height)?;
         let format = unsafe { CVPixelBufferGetPixelFormatType(pixel_buffer) };
-        let mut data = vec![0_u8; FrameLayout::packed(size, PixelFormat::Rgb24)?.data_len()];
-        match format {
-            KCV_PIXEL_FORMAT_TYPE_32_BGRA => {
-                copy_bgra(pixel_buffer, width as usize, height as usize, &mut data)?
-            }
-            KCV_PIXEL_FORMAT_TYPE_420_V | KCV_PIXEL_FORMAT_TYPE_420_F => {
-                copy_nv12(pixel_buffer, width as usize, height as usize, &mut data)?
-            }
+        let pixel_format = match format {
+            KCV_PIXEL_FORMAT_TYPE_32_BGRA => PixelFormat::Bgra32,
+            KCV_PIXEL_FORMAT_TYPE_420_V | KCV_PIXEL_FORMAT_TYPE_420_F => PixelFormat::Rgb24,
             _ => {
                 return Err(DcError::Unsupported(format!(
                     "unsupported VideoToolbox pixel format 0x{format:08x}"
                 )))
             }
+        };
+        let layout = FrameLayout::packed(size, pixel_format)?;
+        let mut data = vec![0_u8; layout.data_len()];
+        match format {
+            KCV_PIXEL_FORMAT_TYPE_32_BGRA => copy_bgra(
+                pixel_buffer,
+                width as usize,
+                height as usize,
+                &mut data,
+                layout.stride(),
+            )?,
+            KCV_PIXEL_FORMAT_TYPE_420_V | KCV_PIXEL_FORMAT_TYPE_420_F => {
+                copy_nv12(pixel_buffer, width as usize, height as usize, &mut data)?
+            }
+            _ => unreachable!("pixel format was validated above"),
         }
-        let layout = FrameLayout::packed(size, PixelFormat::Rgb24)?;
         let _ = source_layout;
         VideoFrame::new(sequence, timestamp, layout, data)
     })();
@@ -431,6 +498,7 @@ fn copy_bgra(
     width: usize,
     height: usize,
     output: &mut [u8],
+    output_stride: usize,
 ) -> Result<()> {
     let source_stride = unsafe { CVPixelBufferGetBytesPerRow(pixel_buffer) };
     let source = unsafe { CVPixelBufferGetBaseAddress(pixel_buffer) };
@@ -439,17 +507,16 @@ fn copy_bgra(
             "VideoToolbox returned an invalid BGRA buffer".into(),
         ));
     }
+    if output_stride < width * 4 || output.len() < output_stride.saturating_mul(height) {
+        return Err(DcError::Codec(
+            "VideoToolbox returned an invalid BGRA destination buffer".into(),
+        ));
+    }
     for y in 0..height {
         let src = unsafe {
             std::slice::from_raw_parts((source as *const u8).add(y * source_stride), width * 4)
         };
-        for x in 0..width {
-            output[(y * width + x) * 3..(y * width + x) * 3 + 3].copy_from_slice(&[
-                src[x * 4 + 2],
-                src[x * 4 + 1],
-                src[x * 4],
-            ]);
-        }
+        output[y * output_stride..y * output_stride + width * 4].copy_from_slice(src);
     }
     Ok(())
 }

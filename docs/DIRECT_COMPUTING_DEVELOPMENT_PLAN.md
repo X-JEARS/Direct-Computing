@@ -581,6 +581,7 @@ Wayland 放在 X11 之后实现。
 - [x] 记录 capture/encode/send/receive/decode/present 的阶段耗时和接收至显示延迟
 - [x] 接入通用 Windows Media Foundation H.264 MFT 后端（优先硬件、软件回退）
 - [x] macOS Viewer 接入 VideoToolbox H.264 解码并保留 OpenH264 运行时回退
+- [x] macOS Viewer 保留 VideoToolbox 原生 BGRA 输出并通过 Metal 窗口呈现，跳过 RGB24 颜色转换
 - [ ] 在 1080p/30 下完成端到端 P95 延迟基准
 
 当前软件编码器会在 Host 启动时报告 backend、hardware、zero-copy 和 low-latency 能力；
@@ -589,8 +590,9 @@ Wayland 放在 X11 之后实现。
 捕获时钟字段和双机基准测试。
 
 macOS Viewer 优先使用系统 VideoToolbox 解码 H.264，并在解码失败时切换到 OpenH264。
-当前 VideoToolbox 输出会复制并转换为 RGB24 以兼容现有窗口；Metal/CVPixelBuffer
-零拷贝显示仍属于后续渲染优化。
+VideoToolbox 会请求原生 BGRA 输出；macOS 的 minifb 窗口使用 Metal 上传和呈现该缓冲区，
+因此不再执行逐像素 RGB24 颜色转换。CVPixelBuffer 直接交给 Metal 的完全零拷贝显示仍属于
+后续渲染优化。
 
 该阶段只提前硬件 H.264 的最小可用后端和流水线基础；QSV、VA-API、NVENC、
 VideoToolbox 的完整能力矩阵和零拷贝渲染、HEVC/AV1 以及安装包仍保留在阶段 7。

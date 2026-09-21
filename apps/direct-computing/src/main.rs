@@ -545,6 +545,11 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
             let mut video = connection.accept_stream().await?;
             let mut decoder = create_viewer_decoder()?;
             let mut sink = PreviewWindowSink::new("Direct Computing - Remote Desktop");
+            log(
+                LogLevel::Info,
+                "direct-computing::stream-viewer",
+                &format!("present backend={}", PreviewWindowSink::render_backend()),
+            );
             let mut desktop_size = None;
             // Keep only the newest packet. An unbounded or FIFO queue turns a
             // slow decoder into steadily increasing end-to-end latency.
