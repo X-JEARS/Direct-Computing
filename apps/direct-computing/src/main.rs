@@ -202,7 +202,16 @@ fn run_network_host(address: &str, password: &str) -> Result<()> {
                 }
             });
             let mut video = connection.open_stream().await?;
-            send_desktop_frames(&mut video).await
+            let result = send_desktop_frames(&mut video).await;
+            if let Err(error) = &result {
+                log(
+                    LogLevel::Error,
+                    "direct-computing::stream-host",
+                    &format!("video stream stopped: {error}"),
+                );
+                connection.close(1, b"host video stream stopped");
+            }
+            result
         })
 }
 
@@ -582,12 +591,27 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
             let mut receive_to_present_total = Duration::ZERO;
             let mut report_started = Instant::now();
             while sink.is_open() {
-                if video_rx.has_changed().unwrap_or(false) {
-                    let received = video_rx
+                let video_changed = match video_rx.has_changed() {
+                    Ok(changed) => changed,
+                    Err(_) => {
+                        return Err(DcError::Platform(
+                            "video stream closed without a final status".into(),
+                        ));
+                    }
+                };
+                if video_changed {
+                    let update = video_rx
                         .borrow_and_update()
                         .clone()
-                        .ok_or_else(|| DcError::Platform("video receiver ended".into()))?
-                        .map_err(|error| DcError::Io(std::io::Error::other(error)))?;
+                        .ok_or_else(|| DcError::Platform("video receiver ended".into()))?;
+                    let received = match update {
+                        Ok(received) => received,
+                        Err(error) => {
+                            return Err(DcError::Platform(format!(
+                                "video stream closed: {error}"
+                            )));
+                        }
+                    };
                     let sequence = video_sequence(received.message.as_ref());
                     if let (Some(previous), Some(current)) = (last_sequence, sequence) {
                         dropped += current.saturating_sub(previous.saturating_add(1));

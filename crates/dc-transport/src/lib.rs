@@ -3,7 +3,10 @@
 use dc_common::{DcError, Result};
 use dc_protocol::{WireMessage, MAX_MESSAGE_SIZE};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
-use quinn::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig};
+use quinn::{
+    ClientConfig, Connection, Endpoint, RecvStream, SendStream, ServerConfig, TransportConfig,
+    VarInt,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
@@ -58,7 +61,9 @@ impl QuicServer {
             .map_err(|error| DcError::Platform(format!("configure TLS server: {error}")))?;
         let crypto = QuicServerConfig::try_from(crypto)
             .map_err(|error| DcError::Platform(format!("configure QUIC TLS server: {error}")))?;
-        let endpoint = Endpoint::server(ServerConfig::with_crypto(Arc::new(crypto)), address)
+        let mut config = ServerConfig::with_crypto(Arc::new(crypto));
+        config.transport_config(streaming_transport_config()?);
+        let endpoint = Endpoint::server(config, address)
             .map_err(|error| DcError::Io(std::io::Error::other(error)))?;
         Ok(Self {
             endpoint,
@@ -119,7 +124,9 @@ impl QuicClient {
             .with_no_client_auth();
         let crypto = QuicClientConfig::try_from(crypto)
             .map_err(|error| DcError::Platform(format!("configure QUIC TLS client: {error}")))?;
-        endpoint.set_default_client_config(ClientConfig::new(Arc::new(crypto)));
+        let mut config = ClientConfig::new(Arc::new(crypto));
+        config.transport_config(streaming_transport_config()?);
+        endpoint.set_default_client_config(config);
         Ok(Self { endpoint, verifier })
     }
 
@@ -150,6 +157,10 @@ impl QuicConnection {
     }
     pub fn rtt(&self) -> Duration {
         self.connection.rtt()
+    }
+    /// Immediately terminate the connection and notify the peer of the reason.
+    pub fn close(&self, error_code: u32, reason: &[u8]) {
+        self.connection.close(VarInt::from_u32(error_code), reason);
     }
     pub async fn open_stream(&self) -> Result<FramedStream> {
         let (send, recv) = self
@@ -212,6 +223,16 @@ impl FramedStream {
 
 fn map_quic_io(error: impl std::fmt::Display) -> DcError {
     DcError::Io(std::io::Error::other(error.to_string()))
+}
+
+fn streaming_transport_config() -> Result<Arc<TransportConfig>> {
+    let mut config = TransportConfig::default();
+    config.keep_alive_interval(Some(Duration::from_secs(2)));
+    let idle_timeout = Duration::from_secs(10)
+        .try_into()
+        .map_err(|error| DcError::InvalidInput(format!("invalid QUIC idle timeout: {error}")))?;
+    config.max_idle_timeout(Some(idle_timeout));
+    Ok(Arc::new(config))
 }
 
 #[derive(Debug)]

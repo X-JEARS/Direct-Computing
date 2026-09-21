@@ -16,13 +16,13 @@ currently a Viewer only; macOS Host capture is not implemented yet.
 On Windows, start the Host:
 
 ```powershell
-cargo run -p direct-computing -- --host 0.0.0.0:22100 '<password>'
+cargo run --release -p direct-computing -- --host 0.0.0.0:22100 '<password>'
 ```
 
 Record the printed certificate SHA-256 fingerprint. On macOS, connect using the Windows address:
 
 ```sh
-cargo run -p direct-computing -- --connect <windows-ip>:22100 '<password>'
+cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<password>'
 ```
 
 At startup, confirm that the Viewer reports:
@@ -32,6 +32,15 @@ decoder backend=apple-videotoolbox-h264 hardware=true zero_copy=false low_latenc
 present backend=metal
 ```
 
+On the Windows Host, the corresponding successful hardware path should report:
+
+```text
+encoder backend=windows-media-foundation-h264 hardware=true zero_copy=false low_latency=true
+```
+
+If the Host reports `openh264-h264 hardware=false`, inspect the preceding Media Foundation
+warning. A configuration-stage HRESULT identifies why the MFT was rejected.
+
 If VideoToolbox cannot accept or decode the stream, the Viewer logs the failure and switches to
 OpenH264. Treat fallback as a functional pass but not as a hardware-acceleration performance pass.
 
@@ -39,7 +48,7 @@ The first connection reports the server fingerprint. After confirming it out of 
 the optional fingerprint argument to exercise certificate pinning:
 
 ```sh
-cargo run -p direct-computing -- --connect <windows-ip>:22100 '<password>' '<cert-sha256>'
+cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<password>' '<cert-sha256>'
 ```
 
 ## Acceptance checks
@@ -54,6 +63,8 @@ cargo run -p direct-computing -- --connect <windows-ip>:22100 '<password>' '<cer
   Windows. Verify only on a disposable test desktop; remote input is intentionally enabled by the
   `control_input` permission.
 - A changed certificate fingerprint is rejected when the pinned value is supplied.
+- Stop the Host during streaming and verify that the Viewer reports the video-stream closure and
+  exits instead of waiting indefinitely; a Host-side encoder failure should close the QUIC session.
 - Record both machines' OS versions, Rust versions, network type, resolution, FPS, skipped frames,
   decoder backend, decode/present/receive-to-present timings, and any firewall or reconnect behavior.
 

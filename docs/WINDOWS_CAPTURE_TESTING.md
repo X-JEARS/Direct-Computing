@@ -76,10 +76,12 @@ The software H.264 path is not expected to sustain 4K/60 at this stage. Record t
 metrics so later bitrate, pacing, and hardware-encoder work has a baseline.
 
 The network Host attempts the vendor-neutral Windows Media Foundation H.264 MFT first. Media
-Foundation enumerates hardware encoders before synchronous software MFTs; if initialization fails,
-the Host logs the reason and falls back to OpenH264. The current Media Foundation adapter accepts
-CPU BGRA frames and converts them to NV12, so it is a hardware compression path but not yet a
-D3D11 zero-copy path. Host logs report the selected backend and its hardware/zero-copy capability.
+Foundation enumerates hardware encoders before synchronous software MFTs. Both synchronous and
+asynchronous MFTs are supported; asynchronous transforms are unlocked and drained through their
+Media Foundation output events. If initialization fails, the Host logs the stage and reason before
+falling back to OpenH264. The current Media Foundation adapter accepts CPU BGRA frames and
+converts them to NV12, so it is a hardware compression path but not yet a D3D11 zero-copy path.
+Host logs report the selected backend and its hardware/zero-copy capability.
 
 ## Runtime scenarios
 
