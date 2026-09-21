@@ -19,9 +19,15 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# VideoToolbox/CoreMedia/CoreVideo are linked directly from the macOS SDK; no
+# third-party runtime dependency is required for the Viewer decoder.
 
 # FFI is isolated in this crate; all other workspace crates continue to forbid unsafe code.
 [lints.rust]

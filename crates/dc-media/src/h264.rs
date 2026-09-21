@@ -1,6 +1,6 @@
 use crate::{
-    EncodeOutcome, EncodedVideoPacket, FrameLayout, PixelFormat, VideoCodec, VideoDecoder,
-    VideoEncoder, VideoFrame,
+    DecoderCapabilities, EncodeOutcome, EncodedVideoPacket, EncoderCapabilities, FrameLayout,
+    PixelFormat, VideoCodec, VideoDecoder, VideoEncoder, VideoFrame,
 };
 use dc_common::{DcError, Result};
 use openh264::decoder::Decoder;
@@ -40,6 +40,17 @@ impl OpenH264Encoder {
 impl VideoEncoder for OpenH264Encoder {
     fn codec(&self) -> VideoCodec {
         VideoCodec::H264
+    }
+
+    fn capabilities(&self) -> EncoderCapabilities {
+        EncoderCapabilities {
+            backend: "openh264",
+            codec: VideoCodec::H264,
+            hardware_accelerated: false,
+            zero_copy_input: false,
+            low_latency: true,
+            supports_force_keyframe: false,
+        }
     }
 
     fn encode(&mut self, frame: VideoFrame) -> Result<EncodeOutcome> {
@@ -102,6 +113,16 @@ impl OpenH264Decoder {
 impl VideoDecoder for OpenH264Decoder {
     fn codec(&self) -> VideoCodec {
         VideoCodec::H264
+    }
+
+    fn capabilities(&self) -> DecoderCapabilities {
+        DecoderCapabilities {
+            backend: "openh264",
+            codec: VideoCodec::H264,
+            hardware_accelerated: false,
+            zero_copy_output: false,
+            low_latency: true,
+        }
     }
 
     fn decode(&mut self, packet: EncodedVideoPacket) -> Result<VideoFrame> {
@@ -186,5 +207,26 @@ mod tests {
         assert!(OpenH264Encoder::new(0, 30.0).is_err());
         assert!(OpenH264Encoder::new(500_000, 0.0).is_err());
         assert!(OpenH264Encoder::new(500_000, f32::NAN).is_err());
+    }
+
+    #[test]
+    fn openh264_reports_software_low_latency_capabilities() {
+        let encoder = OpenH264Encoder::new(500_000, 30.0).unwrap();
+        let capabilities = encoder.capabilities();
+        assert_eq!(capabilities.backend, "openh264");
+        assert!(!capabilities.hardware_accelerated);
+        assert!(!capabilities.zero_copy_input);
+        assert!(capabilities.low_latency);
+    }
+
+    #[test]
+    fn openh264_decoder_reports_software_capabilities() {
+        let decoder = OpenH264Decoder::new().unwrap();
+        let capabilities = decoder.capabilities();
+        assert_eq!(capabilities.backend, "openh264");
+        assert_eq!(capabilities.codec, VideoCodec::H264);
+        assert!(!capabilities.hardware_accelerated);
+        assert!(!capabilities.zero_copy_output);
+        assert!(capabilities.low_latency);
     }
 }

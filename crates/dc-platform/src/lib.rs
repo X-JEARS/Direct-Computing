@@ -8,6 +8,10 @@ use dc_protocol::InputEvent;
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::WindowsDesktopCapturer;
+#[cfg(target_os = "windows")]
+mod media_foundation;
+#[cfg(target_os = "windows")]
+pub use media_foundation::WindowsMediaFoundationH264Encoder;
 
 /// Sink for authenticated remote input events.
 pub trait InputInjector {
@@ -26,3 +30,8 @@ pub trait SystemService {}
 
 #[cfg(target_os = "windows")]
 pub use windows::WindowsInputInjector;
+
+#[cfg(target_os = "macos")]
+mod video_toolbox;
+#[cfg(target_os = "macos")]
+pub use video_toolbox::VideoToolboxH264Decoder;

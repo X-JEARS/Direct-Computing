@@ -25,6 +25,15 @@ Record the printed certificate SHA-256 fingerprint. On macOS, connect using the 
 cargo run -p direct-computing -- --connect <windows-ip>:22100 '<password>'
 ```
 
+At startup, confirm that the Viewer reports:
+
+```text
+decoder backend=apple-videotoolbox-h264 hardware=true zero_copy=false low_latency=true
+```
+
+If VideoToolbox cannot accept or decode the stream, the Viewer logs the failure and switches to
+OpenH264. Treat fallback as a functional pass but not as a hardware-acceleration performance pass.
+
 The first connection reports the server fingerprint. After confirming it out of band, repeat with
 the optional fingerprint argument to exercise certificate pinning:
 
@@ -42,7 +51,7 @@ cargo run -p direct-computing -- --connect <windows-ip>:22100 '<password>' '<cer
   `control_input` permission.
 - A changed certificate fingerprint is rejected when the pinned value is supplied.
 - Record both machines' OS versions, Rust versions, network type, resolution, FPS, skipped frames,
-  and any firewall or reconnect behavior.
+  decoder backend, decode/present/receive-to-present timings, and any firewall or reconnect behavior.
 
 This test demonstrates cross-platform stage 2 interoperability. It does not replace the remaining
 Windows ↔ Windows long-duration benchmark, multi-monitor validation, or a future native macOS Host

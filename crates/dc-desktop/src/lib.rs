@@ -48,6 +48,61 @@ pub fn message_to_packet(message: WireMessage) -> Result<EncodedVideoPacket> {
     else {
         return Err(DcError::InvalidInput("expected video message".into()));
     };
+    packet_from_parts(
+        codec,
+        sequence,
+        timestamp_millis,
+        keyframe,
+        width,
+        height,
+        pixel_format,
+        stride,
+        data,
+    )
+}
+
+/// Decode a video message without cloning the message envelope. The encoded
+/// payload is copied once into the owned packet required by the decoder.
+pub fn message_to_packet_ref(message: &WireMessage) -> Result<EncodedVideoPacket> {
+    let WireMessage::Video {
+        codec,
+        sequence,
+        timestamp_millis,
+        keyframe,
+        width,
+        height,
+        pixel_format,
+        stride,
+        data,
+    } = message
+    else {
+        return Err(DcError::InvalidInput("expected video message".into()));
+    };
+    packet_from_parts(
+        *codec,
+        *sequence,
+        *timestamp_millis,
+        *keyframe,
+        *width,
+        *height,
+        *pixel_format,
+        *stride,
+        data.clone(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn packet_from_parts(
+    codec: u8,
+    sequence: u64,
+    timestamp_millis: u64,
+    keyframe: bool,
+    width: u32,
+    height: u32,
+    pixel_format: u8,
+    stride: u32,
+    data: Vec<u8>,
+) -> Result<EncodedVideoPacket> {
     let codec = match codec {
         0 => VideoCodec::Raw,
         1 => VideoCodec::H264,

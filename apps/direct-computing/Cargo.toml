@@ -19,5 +19,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 [target.'cfg(windows)'.dependencies]
 dc-platform = { path = "../../crates/dc-platform" }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+dc-platform = { path = "../../crates/dc-platform" }
+
 [lints]
 workspace = true

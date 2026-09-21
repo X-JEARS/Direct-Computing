@@ -9,6 +9,33 @@ pub trait FrameSource {
 pub trait VideoEncoder {
     fn codec(&self) -> VideoCodec;
     fn encode(&mut self, frame: VideoFrame) -> Result<EncodeOutcome>;
+
+    fn capabilities(&self) -> EncoderCapabilities {
+        EncoderCapabilities::software(self.codec())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EncoderCapabilities {
+    pub backend: &'static str,
+    pub codec: VideoCodec,
+    pub hardware_accelerated: bool,
+    pub zero_copy_input: bool,
+    pub low_latency: bool,
+    pub supports_force_keyframe: bool,
+}
+
+impl EncoderCapabilities {
+    pub const fn software(codec: VideoCodec) -> Self {
+        Self {
+            backend: "software",
+            codec,
+            hardware_accelerated: false,
+            zero_copy_input: false,
+            low_latency: false,
+            supports_force_keyframe: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,6 +47,31 @@ pub enum EncodeOutcome {
 pub trait VideoDecoder {
     fn codec(&self) -> VideoCodec;
     fn decode(&mut self, packet: EncodedVideoPacket) -> Result<VideoFrame>;
+
+    fn capabilities(&self) -> DecoderCapabilities {
+        DecoderCapabilities::software(self.codec())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecoderCapabilities {
+    pub backend: &'static str,
+    pub codec: VideoCodec,
+    pub hardware_accelerated: bool,
+    pub zero_copy_output: bool,
+    pub low_latency: bool,
+}
+
+impl DecoderCapabilities {
+    pub const fn software(codec: VideoCodec) -> Self {
+        Self {
+            backend: "software",
+            codec,
+            hardware_accelerated: false,
+            zero_copy_output: false,
+            low_latency: false,
+        }
+    }
 }
 
 pub trait FrameSink {
