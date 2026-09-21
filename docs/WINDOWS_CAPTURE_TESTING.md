@@ -121,6 +121,19 @@ actually run, not a substitute for the scenario matrix above.
   total. Average capture, encode, decode, and display times were 5.7 ms, 1450.5 ms, 353.1 ms,
   and 115.3 ms respectively. The log did not include process memory, CPU, GPU, or handle samples,
   so resource-growth and utilization conclusions still require a rerun with external monitoring.
+- A supplementary monitored run used a PowerShell performance monitor with a single physical
+  output and completed the 60-second smoke test (`elapsed=64.15s`, final 0.4 FPS, 1 skipped frame) and
+  the 30-minute soak test (`elapsed=1800.36s`, final 0.6 FPS, 34 skipped frames) without errors.
+  The 30-minute final interval reported 6.1 MB/s raw throughput, 14.0 KB/s H.264 throughput,
+  4.8 ms capture, 1062.5 ms encode, 325.9 ms decode, and 115.4 ms display time. Across 326
+  performance samples, process CPU averaged 5.98% (maximum 6%), working-set memory ranged from
+  107.5 to 146.1 MB (145.4 MB at start and 131.7 MB at end), private memory ranged from 111.8
+  to 132.9 MB (132.5 MB at start and 132.7 MB at end), and handle count stayed between 295 and
+  299. These samples show no continuous memory or handle growth. The system CPU average was
+  46.13% with a 91% maximum, which includes unrelated desktop activity; the per-process GPU
+  engine sample averaged 0.11% and peaked at 0.52%. The requested one-second sampling interval
+  was not achieved: effective intervals ranged from 4.6 to 8.3 seconds (median 5.2 seconds),
+  so the monitor is suitable for resource-growth trends rather than one-second profiling.
 
 Window resizing, Escape, and close-window behavior also require an interactive desktop window and
 were not claimed as automated passes in this record. Do not mark those checks complete without
