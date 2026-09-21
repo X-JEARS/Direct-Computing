@@ -51,9 +51,10 @@ impl PreviewWindowSink {
             let (frame_width, frame_height) = self
                 .frame_size
                 .unwrap_or((window_width.max(1), window_height.max(1)));
-            // minifb reports the pointer in the window's client area.  The
-            // image is stretched to that area, so map it back to decoded
-            // frame pixels instead of treating client pixels as source pixels.
+            // minifb reports the pointer in the window's client area.  With
+            // AspectRatioStretch the image is aspect-fitted and letterboxed,
+            // so first remove the black-bar offsets before scaling to frame
+            // pixels.
             let (x, y) = map_pointer_to_frame(
                 mouse_x,
                 mouse_y,
@@ -127,10 +128,33 @@ fn map_pointer_to_frame(
     frame_width: usize,
     frame_height: usize,
 ) -> (i32, i32) {
-    let x = (mouse_x * frame_width as f32 / window_width.max(1) as f32)
+    let frame_aspect = frame_width as f32 / frame_height.max(1) as f32;
+    let window_aspect = window_width.max(1) as f32 / window_height.max(1) as f32;
+    let (display_width, display_height, offset_x, offset_y) = if frame_aspect > window_aspect {
+        let display_width = window_width.max(1) as f32;
+        let display_height = display_width / frame_aspect;
+        (
+            display_width,
+            display_height,
+            0.0,
+            (window_height.max(1) as f32 - display_height) / 2.0,
+        )
+    } else {
+        let display_height = window_height.max(1) as f32;
+        let display_width = display_height * frame_aspect;
+        (
+            display_width,
+            display_height,
+            (window_width.max(1) as f32 - display_width) / 2.0,
+            0.0,
+        )
+    };
+    let image_x = (mouse_x - offset_x).clamp(0.0, display_width);
+    let image_y = (mouse_y - offset_y).clamp(0.0, display_height);
+    let x = (image_x * frame_width as f32 / display_width)
         .floor()
         .clamp(0.0, frame_width.saturating_sub(1) as f32) as i32;
-    let y = (mouse_y * frame_height as f32 / window_height.max(1) as f32)
+    let y = (image_y * frame_height as f32 / display_height)
         .floor()
         .clamp(0.0, frame_height.saturating_sub(1) as f32) as i32;
     (x, y)
@@ -244,6 +268,27 @@ mod tests {
         assert_eq!(
             map_pointer_to_frame(999.0, 999.0, 640, 360, 1_280, 720),
             (1_279, 719)
+        );
+    }
+
+    #[test]
+    fn ignores_letterbox_bars_when_mapping_pointer() {
+        // A 16:9 frame in a 4:3 window has vertical black bars.
+        assert_eq!(map_pointer_to_frame(0.0, 0.0, 800, 600, 1_280, 720), (0, 0));
+        assert_eq!(
+            map_pointer_to_frame(400.0, 300.0, 800, 600, 1_280, 720),
+            (640, 360)
+        );
+        assert_eq!(
+            map_pointer_to_frame(800.0, 600.0, 800, 600, 1_280, 720),
+            (1_279, 719)
+        );
+
+        // A 4:3 frame in a 16:9 window has horizontal black bars.
+        assert_eq!(map_pointer_to_frame(0.0, 0.0, 1_280, 720, 800, 600), (0, 0));
+        assert_eq!(
+            map_pointer_to_frame(640.0, 360.0, 1_280, 720, 800, 600),
+            (400, 300)
         );
     }
 }
