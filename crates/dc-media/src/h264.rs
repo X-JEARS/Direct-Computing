@@ -53,6 +53,11 @@ impl VideoEncoder for OpenH264Encoder {
         }
     }
 
+    fn force_keyframe(&mut self) -> Result<()> {
+        self.encoder.force_intra_frame();
+        Ok(())
+    }
+
     fn encode(&mut self, frame: VideoFrame) -> Result<EncodeOutcome> {
         let layout = frame.layout();
         let size = layout.size();

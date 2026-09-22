@@ -243,3 +243,8 @@ mod tests {
         assert!(result.bitrate < 1_000 && result.frames_per_second < 30);
     }
 }
+
+mod video_datagram;
+
+pub use video_datagram::packetize_video_message;
+pub use video_datagram::{VideoDatagramReassembler, VideoDatagramStats};

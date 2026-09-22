@@ -114,6 +114,20 @@ impl PreviewWindowSink {
         }
     }
 
+    /// Create a visible placeholder surface before the first decoded frame.
+    /// This keeps the Viewer window discoverable while the first keyframe is
+    /// being reassembled over the lossy media lane.
+    pub fn show_placeholder(&mut self, width: usize, height: usize) -> Result<()> {
+        self.ensure_window(width, height)?;
+        self.frame_size = Some((width, height));
+        self.pixels.resize(width.saturating_mul(height), 0);
+        self.window
+            .as_mut()
+            .ok_or_else(|| DcError::Platform("preview window was not created".into()))?
+            .update_with_buffer(&self.pixels, width, height)
+            .map_err(|error| DcError::Platform(format!("show preview window: {error}")))
+    }
+
     fn ensure_window(&mut self, width: usize, height: usize) -> Result<&mut Window> {
         if self.window.is_none() {
             let (window_width, window_height) = initial_window_size(width, height);

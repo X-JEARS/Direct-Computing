@@ -10,6 +10,15 @@ pub trait VideoEncoder {
     fn codec(&self) -> VideoCodec;
     fn encode(&mut self, frame: VideoFrame) -> Result<EncodeOutcome>;
 
+    /// Request an intra frame for recovery after a lossy transport gap.
+    /// Encoders that cannot change their frame type at runtime may keep the
+    /// default unsupported implementation and rely on their normal IDR cadence.
+    fn force_keyframe(&mut self) -> Result<()> {
+        Err(DcError::Unsupported(
+            "encoder does not support forcing a keyframe".into(),
+        ))
+    }
+
     fn capabilities(&self) -> EncoderCapabilities {
         EncoderCapabilities::software(self.codec())
     }

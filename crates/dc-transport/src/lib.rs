@@ -1,5 +1,6 @@
 //! QUIC/TLS transport and length-delimited protocol streams.
 
+use bytes::Bytes;
 use dc_common::{DcError, Result};
 use dc_protocol::{WireMessage, MAX_MESSAGE_SIZE};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -158,6 +159,27 @@ impl QuicConnection {
     pub fn rtt(&self) -> Duration {
         self.connection.rtt()
     }
+    /// Return a snapshot of QUIC path and congestion statistics.
+    pub fn stats(&self) -> quinn::ConnectionStats {
+        self.connection.stats()
+    }
+    /// Return the largest application datagram currently supported by the path.
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.connection.max_datagram_size()
+    }
+    /// Send an unreliable, unordered application datagram.
+    pub fn send_datagram(&self, data: Bytes) -> Result<()> {
+        self.connection
+            .send_datagram(data)
+            .map_err(|error| DcError::Platform(format!("send QUIC datagram: {error}")))
+    }
+    /// Receive an unreliable, unordered application datagram.
+    pub async fn receive_datagram(&self) -> Result<Bytes> {
+        self.connection
+            .read_datagram()
+            .await
+            .map_err(|error| DcError::Platform(format!("receive QUIC datagram: {error}")))
+    }
     /// Immediately terminate the connection and notify the peer of the reason.
     pub fn close(&self, error_code: u32, reason: &[u8]) {
         self.connection.close(VarInt::from_u32(error_code), reason);
@@ -227,6 +249,11 @@ fn map_quic_io(error: impl std::fmt::Display) -> DcError {
 
 fn streaming_transport_config() -> Result<Arc<TransportConfig>> {
     let mut config = TransportConfig::default();
+    // Enable a bounded unreliable media lane. Video packets are deliberately
+    // allowed to be discarded under congestion instead of queueing stale
+    // frames behind reliable stream retransmissions.
+    config.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
+    config.datagram_send_buffer_size(2 * 1024 * 1024);
     config.keep_alive_interval(Some(Duration::from_secs(2)));
     let idle_timeout = Duration::from_secs(10)
         .try_into()
@@ -465,4 +492,31 @@ mod tests {
             value
         );
     }
+}
+
+#[test]
+fn datagrams_round_trip_between_configured_peers() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let server = QuicServer::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let client = QuicClient::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address = server.local_addr().unwrap();
+            let server_task = tokio::spawn(async move { server.accept().await.unwrap() });
+            let client_connection = client.connect(address).await.unwrap();
+            let server_connection = server_task.await.unwrap();
+            let max_size = client_connection.max_datagram_size().unwrap();
+            assert!(max_size >= 1_000);
+            client_connection
+                .send_datagram(Bytes::from_static(b"datagram-test"))
+                .unwrap();
+            let received =
+                tokio::time::timeout(Duration::from_secs(1), server_connection.receive_datagram())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(&received[..], b"datagram-test");
+        });
 }

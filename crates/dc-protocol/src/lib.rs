@@ -84,6 +84,10 @@ pub enum WireMessage {
         bitrate: u32,
         frames_per_second: u16,
     },
+    /// Ask the encoder to emit a fresh intra frame after a lossy media gap.
+    KeyframeRequest {
+        last_sequence: u64,
+    },
     FileOffer {
         transfer_id: [u8; 16],
         name: String,
@@ -180,6 +184,10 @@ impl WireMessage {
                 output.push(9);
                 put_u32(&mut output, *bitrate);
                 put_u16(&mut output, *frames_per_second);
+            }
+            Self::KeyframeRequest { last_sequence } => {
+                output.push(14);
+                put_u64(&mut output, *last_sequence);
             }
             Self::FileOffer {
                 transfer_id,
@@ -281,6 +289,9 @@ impl WireMessage {
             9 => Self::RateHint {
                 bitrate: reader.u32()?,
                 frames_per_second: reader.u16()?,
+            },
+            14 => Self::KeyframeRequest {
+                last_sequence: reader.u64()?,
             },
             10 => Self::FileOffer {
                 transfer_id: reader.array_16()?,
@@ -464,6 +475,15 @@ mod tests {
         let mut encoded = WireMessage::Close.encode().unwrap();
         encoded.push(0);
         assert!(WireMessage::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn keyframe_requests_round_trip() {
+        let message = WireMessage::KeyframeRequest { last_sequence: 99 };
+        assert_eq!(
+            WireMessage::decode(&message.encode().unwrap()).unwrap(),
+            message
+        );
     }
 
     #[test]

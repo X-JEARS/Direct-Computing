@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "QUIC transport abstraction for Direct Computing"
 
 [dependencies]
+bytes = "1"
 dc-common = { path = "../dc-common" }
 dc-protocol = { path = "../dc-protocol" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }

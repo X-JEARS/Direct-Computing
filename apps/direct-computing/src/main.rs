@@ -1,7 +1,7 @@
 use dc_auth::{PasswordVerifier, Permissions};
 use dc_common::{init_logging, log, DcError, LogLevel, Result};
-use dc_desktop::packet_to_message;
 use dc_desktop::validate_input;
+use dc_desktop::{packet_to_message, packetize_video_message, VideoDatagramReassembler};
 #[cfg(target_os = "windows")]
 use dc_media::{write_bmp, LastFrameSink};
 use dc_media::{
@@ -19,9 +19,10 @@ use dc_platform::{
 use dc_protocol::PROTOCOL_VERSION;
 use dc_protocol::{Capabilities, WireMessage};
 use dc_session::{authenticate_client, authenticate_server};
-use dc_transport::{format_fingerprint, parse_fingerprint, QuicClient, QuicServer};
+use dc_transport::{format_fingerprint, parse_fingerprint, QuicClient, QuicConnection, QuicServer};
 use dc_ui::PreviewWindowSink;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -194,8 +195,11 @@ fn run_network_host(address: &str, password: &str) -> Result<()> {
             )
             .await?;
             control.send(&WireMessage::OpenDesktop).await?;
+            let keyframe_requested = Arc::new(AtomicBool::new(false));
+            let input_keyframe_requested = keyframe_requested.clone();
             tokio::spawn(async move {
-                if let Err(error) = receive_host_input(&mut control).await {
+                if let Err(error) = receive_host_input(&mut control, input_keyframe_requested).await
+                {
                     log(
                         LogLevel::Warn,
                         "direct-computing::host",
@@ -203,8 +207,7 @@ fn run_network_host(address: &str, password: &str) -> Result<()> {
                     );
                 }
             });
-            let mut video = connection.open_stream().await?;
-            let result = send_desktop_frames(&mut video).await;
+            let result = send_desktop_frames(&connection, keyframe_requested).await;
             if let Err(error) = &result {
                 log(
                     LogLevel::Error,
@@ -218,11 +221,17 @@ fn run_network_host(address: &str, password: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "windows")]
-async fn receive_host_input(stream: &mut dc_transport::FramedStream) -> Result<()> {
+async fn receive_host_input(
+    stream: &mut dc_transport::FramedStream,
+    keyframe_requested: Arc<AtomicBool>,
+) -> Result<()> {
     let mut injector = WindowsInputInjector::new();
     loop {
         match stream.receive().await? {
             WireMessage::Input(event) => injector.inject(&event)?,
+            WireMessage::KeyframeRequest { .. } => {
+                keyframe_requested.store(true, Ordering::Release);
+            }
             WireMessage::Close => return Ok(()),
             _ => {}
         }
@@ -230,13 +239,19 @@ async fn receive_host_input(stream: &mut dc_transport::FramedStream) -> Result<(
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn receive_host_input(stream: &mut dc_transport::FramedStream) -> Result<()> {
+async fn receive_host_input(
+    stream: &mut dc_transport::FramedStream,
+    keyframe_requested: Arc<AtomicBool>,
+) -> Result<()> {
     loop {
         match stream.receive().await? {
             WireMessage::Input(_) => {
                 return Err(DcError::Unsupported(
                     "remote input injection requires Windows Host".into(),
                 ));
+            }
+            WireMessage::KeyframeRequest { .. } => {
+                keyframe_requested.store(true, Ordering::Release);
             }
             WireMessage::Close => return Ok(()),
             _ => {}
@@ -245,9 +260,12 @@ async fn receive_host_input(stream: &mut dc_transport::FramedStream) -> Result<(
 }
 
 #[cfg(target_os = "windows")]
-async fn send_desktop_frames(stream: &mut dc_transport::FramedStream) -> Result<()> {
+async fn send_desktop_frames(
+    connection: &QuicConnection,
+    keyframe_requested: Arc<AtomicBool>,
+) -> Result<()> {
     let source = WindowsDesktopCapturer::new(0, 1_000)?;
-    send_frames_from(stream, source, |frame| {
+    send_frames_from(connection, keyframe_requested, source, |frame| {
         let size = frame.layout().size();
         match WindowsMediaFoundationH264Encoder::new(size.width(), size.height(), 8_000_000, 30) {
             Ok(encoder) => Ok(Box::new(encoder)),
@@ -265,26 +283,36 @@ async fn send_desktop_frames(stream: &mut dc_transport::FramedStream) -> Result<
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn send_desktop_frames(stream: &mut dc_transport::FramedStream) -> Result<()> {
+async fn send_desktop_frames(
+    connection: &QuicConnection,
+    keyframe_requested: Arc<AtomicBool>,
+) -> Result<()> {
     let size = FrameSize::new(640, 360)?;
-    send_frames_from(stream, SyntheticFrameSource::new(size, 30)?, |_| {
-        Ok(Box::new(OpenH264Encoder::new(2_000_000, 30.0)?))
-    })
+    send_frames_from(
+        connection,
+        keyframe_requested,
+        SyntheticFrameSource::new(size, 30)?,
+        |_| Ok(Box::new(OpenH264Encoder::new(2_000_000, 30.0)?)),
+    )
     .await
 }
 
 async fn send_frames_from<S, F>(
-    stream: &mut dc_transport::FramedStream,
+    connection: &QuicConnection,
+    keyframe_requested: Arc<AtomicBool>,
     mut source: S,
     create_encoder: F,
 ) -> Result<()>
 where
     S: dc_media::FrameSource + Send + 'static,
-    F: FnOnce(&dc_media::VideoFrame) -> Result<Box<dyn dc_media::VideoEncoder>> + Send + 'static,
+    F: Fn(&dc_media::VideoFrame) -> Result<Box<dyn dc_media::VideoEncoder>> + Send + 'static,
 {
-    // Keep capture and encoding off the async runtime thread. H.264 packets
-    // must stay ordered: dropping an inter-frame packet would invalidate the
-    // decoder reference chain. Backpressure throttles capture instead.
+    let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
+        DcError::Unsupported("peer did not negotiate QUIC DATAGRAM support".into())
+    })?;
+    // Keep capture and encoding off the async runtime thread. The bounded
+    // producer queue protects the runtime, while the datagram lane allows the
+    // transport to discard stale media instead of blocking control traffic.
     let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<Arc<EncodedFrame>>(4);
     let producer = tokio::task::spawn_blocking(move || -> Result<()> {
         use dc_media::EncodeOutcome;
@@ -296,7 +324,28 @@ where
             }
         };
         let mut pending = (first_frame, first_capture_started.elapsed());
+        let first_source_non_zero = pending.0.data().iter().filter(|byte| **byte > 4).count();
+        let first_source_sample = pending
+            .0
+            .data()
+            .iter()
+            .take(64)
+            .fold(0_u32, |sum, byte| sum.wrapping_add(u32::from(*byte)));
+        log(
+            LogLevel::Info,
+            "direct-computing::stream-host",
+            &format!(
+                "first captured frame sequence={} sample_sum={} non_zero={} dimensions={}x{}",
+                pending.0.sequence(),
+                first_source_sample,
+                first_source_non_zero,
+                pending.0.layout().size().width(),
+                pending.0.layout().size().height()
+            ),
+        );
         let mut encoder = create_encoder(&pending.0)?;
+        let mut last_frame;
+        let mut last_sequence;
         let capabilities = encoder.capabilities();
         log(
             LogLevel::Info,
@@ -320,6 +369,22 @@ where
             let (frame, capture_time) = pending;
             captured += 1;
             capture_total += capture_time;
+            let recovery_frame = frame.clone();
+            last_sequence = frame.sequence();
+            if keyframe_requested.swap(false, Ordering::AcqRel) {
+                if let Err(error) = encoder.force_keyframe() {
+                    log(
+                        LogLevel::Debug,
+                        "direct-computing::stream-host",
+                        &format!("encoder could not force a keyframe: {error}"),
+                    );
+                    // Media Foundation encoders commonly do not expose a
+                    // portable force-IDR control. Recreating the encoder
+                    // resets its GOP and guarantees that the next packet is
+                    // independently decodable.
+                    encoder = create_encoder(&frame)?;
+                }
+            }
             let encode_started = Instant::now();
             if let EncodeOutcome::Packet(packet) = encoder.encode(frame)? {
                 let encode_time = encode_started.elapsed();
@@ -338,6 +403,7 @@ where
                     return Ok(());
                 }
             }
+            last_frame = Some(recovery_frame);
             if report_started.elapsed() >= Duration::from_secs(1) {
                 log(
                     LogLevel::Info,
@@ -366,6 +432,37 @@ where
             let capture_started = Instant::now();
             pending = loop {
                 match source.capture() {
+                    Err(DcError::Timeout(_)) if keyframe_requested.load(Ordering::Acquire) => {
+                        let previous = last_frame.as_ref().ok_or_else(|| {
+                            DcError::Platform(
+                                "keyframe requested before a recoverable frame existed".into(),
+                            )
+                        })?;
+                        let sequence = last_sequence.wrapping_add(1);
+                        let recovered = dc_media::VideoFrame::new(
+                            sequence,
+                            // Desktop Duplication does not deliver a new
+                            // texture while the desktop is static.  Give a
+                            // retransmitted recovery frame a fresh,
+                            // monotonically increasing timestamp; reusing the
+                            // previous timestamp can make H.264 encoders
+                            // classify it as a duplicate and return Skip,
+                            // leaving the viewer with only its initial frame.
+                            previous.timestamp().saturating_add(frame_interval),
+                            previous.layout(),
+                            previous.data().to_vec(),
+                        )?;
+                        log(
+                            LogLevel::Debug,
+                            "direct-computing::stream-host",
+                            &format!(
+                                "desktop unchanged; synthesized recovery frame sequence={} timestamp_ms={}",
+                                recovered.sequence(),
+                                recovered.timestamp().as_millis()
+                            ),
+                        );
+                        break (recovered, Duration::ZERO);
+                    }
                     Err(DcError::Timeout(_)) => continue,
                     result => break (result?, capture_started.elapsed()),
                 }
@@ -374,11 +471,46 @@ where
     });
 
     let mut sent = 0_u64;
+    let mut datagrams_sent = 0_u64;
+    let mut first_frame_logged = false;
     let mut send_total = Duration::ZERO;
     let mut send_report_started = Instant::now();
     while let Some(frame) = packet_rx.recv().await {
         let send_started = Instant::now();
-        stream.send(frame.message.as_ref()).await?;
+        let fragments = packetize_video_message(frame.message.as_ref(), max_datagram_size)?;
+        let keyframe = matches!(
+            frame.message.as_ref(),
+            WireMessage::Video { keyframe: true, .. }
+        );
+        // A keyframe is required before inter frames are useful.  Repeat its
+        // fragments once so a single lost QUIC DATAGRAM does not leave the
+        // viewer waiting for another GOP.  Inter frames remain single-shot to
+        // keep bandwidth and queue pressure bounded on narrow links.
+        let fragment_repetitions = if keyframe { 2 } else { 1 };
+        if !first_frame_logged {
+            log(
+                LogLevel::Info,
+                "direct-computing::stream-host",
+                &format!(
+                    "first video frame sequence={} fragments={} datagram_size={} keyframe={} repetitions={}",
+                    frame.sequence,
+                    fragments.len(),
+                    max_datagram_size,
+                    keyframe,
+                    fragment_repetitions
+                ),
+            );
+            first_frame_logged = true;
+        }
+        for fragment in fragments {
+            for _ in 0..fragment_repetitions {
+                // Datagram sends are intentionally non-blocking. Quinn discards
+                // queued old datagrams when its bounded media buffer is full,
+                // preventing stale frames from delaying input/control streams.
+                connection.send_datagram(fragment.clone().into())?;
+                datagrams_sent = datagrams_sent.saturating_add(1);
+            }
+        }
         let send_time = send_started.elapsed();
         sent += 1;
         send_total += send_time;
@@ -405,6 +537,11 @@ where
                     sent,
                     average_millis(send_total, sent)
                 ),
+            );
+            log(
+                LogLevel::Info,
+                "direct-computing::stream-host",
+                &format!("video datagrams sent={datagrams_sent}"),
             );
             sent = 0;
             send_total = Duration::ZERO;
@@ -625,41 +762,100 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                 ));
             }
             let _ = control.receive().await?;
-            let mut video = connection.accept_stream().await?;
+            let max_datagram_size = connection.max_datagram_size();
+            log(
+                LogLevel::Info,
+                "direct-computing::stream-viewer",
+                &format!(
+                    "video transport=quic-datagram max_datagram_size={:?}",
+                    max_datagram_size
+                ),
+            );
+            if max_datagram_size.is_none() {
+                return Err(DcError::Unsupported(
+                    "peer does not support QUIC DATAGRAM video; update the Host and reconnect"
+                        .into(),
+                ));
+            }
             let mut decoder = create_viewer_decoder()?;
             let mut sink = PreviewWindowSink::new("Direct Computing - Remote Desktop");
+            sink.show_placeholder(640, 360)?;
             log(
                 LogLevel::Info,
                 "direct-computing::stream-viewer",
                 &format!("present backend={}", PreviewWindowSink::render_backend()),
             );
             let mut desktop_size = None;
-            // H.264 packets are reference-dependent. Preserve order and let
-            // QUIC backpressure the sender instead of replacing P-frames.
-            let (video_tx, mut video_rx) = tokio::sync::mpsc::channel::<
-                std::result::Result<ReceivedFrame, String>,
-            >(4);
+            // Video is carried over an unreliable, unordered QUIC DATAGRAM
+            // lane. Incomplete or stale frames are discarded by the
+            // reassembler; control/input continue using the reliable stream.
+            let (video_tx, mut video_rx) = tokio::sync::watch::channel::<
+                Option<std::result::Result<ReceivedFrame, String>>,
+            >(None);
+            let datagram_connection = connection.clone();
             tokio::spawn(async move {
+                let mut reassembler = VideoDatagramReassembler::new();
+                let mut datagrams_received = 0_u64;
                 loop {
                     let received_at = Instant::now();
-                    let result = video
-                        .receive()
-                        .await
-                        .map(|message| ReceivedFrame {
-                            message: Arc::new(message),
-                            received_at,
-                        })
-                        .map_err(|error| error.to_string());
-                    let done = result.is_err();
-                    if video_tx.send(result).await.is_err() {
-                        break;
-                    }
-                    if done {
-                        break;
+                    match datagram_connection.receive_datagram().await {
+                        Ok(datagram) => {
+                            datagrams_received += 1;
+                            if datagrams_received <= 3 {
+                                log(
+                                    LogLevel::Info,
+                                    "direct-computing::stream-viewer",
+                                    &format!(
+                                        "received video datagram index={} bytes={}",
+                                        datagrams_received,
+                                        datagram.len()
+                                    ),
+                                );
+                            }
+                            match reassembler.push(&datagram) {
+                            Ok(Some(message)) => {
+                                log(
+                                    LogLevel::Info,
+                                    "direct-computing::stream-viewer",
+                                    &format!(
+                                        "received complete video frame after {} datagrams",
+                                        datagrams_received
+                                    ),
+                                );
+                                if video_tx
+                                    .send(Some(Ok(ReceivedFrame {
+                                        message: Arc::new(message),
+                                        received_at,
+                                    })))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(None) => continue,
+                            Err(error) => {
+                                log(
+                                    LogLevel::Warn,
+                                    "direct-computing::stream-viewer",
+                                    &format!("video datagram rejected: {error}"),
+                                );
+                                let _ = video_tx.send(Some(Err(error.to_string())));
+                                break;
+                            }
+                            }
+                        }
+                        Err(error) => {
+                            let _ = video_tx.send(Some(Err(error.to_string())));
+                            break;
+                        }
                     }
                 }
             });
             let mut last_sequence: Option<u64> = None;
+            let mut last_keyframe_request: Option<Instant> = None;
+            let mut last_frame_progress = Instant::now();
+            let mut packet_logged = false;
+            let mut decoded_logged = false;
             let mut presented = 0_u64;
             let mut dropped = 0_u64;
             let mut decode_total = Duration::ZERO;
@@ -669,19 +865,20 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
             while sink.is_open() {
                 let update = match tokio::time::timeout(
                     Duration::from_millis(16),
-                    video_rx.recv(),
+                    video_rx.changed(),
                 )
                 .await
                 {
-                    Ok(Some(update)) => Some(update),
-                    Ok(None) => {
+                    Ok(Ok(())) => video_rx.borrow_and_update().clone(),
+                    Ok(Err(_)) => {
                         return Err(DcError::Platform(
-                            "video stream closed without a final status".into(),
+                            "video datagram receiver closed".into(),
                         ));
                     }
                     Err(_) => None,
                 };
                 if let Some(update) = update {
+                    last_frame_progress = Instant::now();
                     let received = match update {
                         Ok(received) => received,
                         Err(error) => {
@@ -692,7 +889,19 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                     };
                     let sequence = video_sequence(received.message.as_ref());
                     if let (Some(previous), Some(current)) = (last_sequence, sequence) {
-                        dropped += current.saturating_sub(previous.saturating_add(1));
+                        let gap = current.saturating_sub(previous.saturating_add(1));
+                        dropped += gap;
+                        if gap > 0
+                            && last_keyframe_request
+                                .is_none_or(|time| time.elapsed() >= Duration::from_secs(2))
+                        {
+                            control
+                                .send(&WireMessage::KeyframeRequest {
+                                    last_sequence: previous,
+                                })
+                                .await?;
+                            last_keyframe_request = Some(Instant::now());
+                        }
                     }
                     last_sequence = sequence;
                     let decode_started = Instant::now();
@@ -701,13 +910,92 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                         packet.source_layout().size().width(),
                         packet.source_layout().size().height(),
                     ));
-                    let frame = decoder.decode(packet)?;
+                    if !packet_logged {
+                        let sample = packet
+                            .data()
+                            .iter()
+                            .take(32)
+                            .fold(0_u32, |sum, byte| sum.wrapping_add(u32::from(*byte)));
+                        log(
+                            LogLevel::Info,
+                            "direct-computing::stream-viewer",
+                            &format!(
+                                "first encoded frame sequence={} keyframe={} bytes={} sample_sum={} dimensions={}x{}",
+                                packet.sequence(),
+                                packet.is_keyframe(),
+                                packet.data().len(),
+                                sample,
+                                packet.source_layout().size().width(),
+                                packet.source_layout().size().height()
+                            ),
+                        );
+                        packet_logged = true;
+                    }
+                    let frame = match decoder.decode(packet) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            if last_keyframe_request
+                                .is_none_or(|time| time.elapsed() >= Duration::from_secs(2))
+                            {
+                                control
+                                    .send(&WireMessage::KeyframeRequest {
+                                        last_sequence: sequence.unwrap_or_default(),
+                                    })
+                                    .await?;
+                                last_keyframe_request = Some(Instant::now());
+                            }
+                            log(
+                                LogLevel::Warn,
+                                "direct-computing::stream-viewer",
+                                &format!("dropping undecodable video frame: {error}"),
+                            );
+                            continue;
+                        }
+                    };
+                    if !decoded_logged {
+                        let sample = frame
+                            .data()
+                            .iter()
+                            .take(64)
+                            .fold(0_u32, |sum, byte| sum.wrapping_add(u32::from(*byte)));
+                        let non_zero = frame.data().iter().filter(|byte| **byte > 4).count();
+                        log(
+                            LogLevel::Info,
+                            "direct-computing::stream-viewer",
+                            &format!(
+                                "first decoded frame sequence={} bytes={} sample_sum={} non_zero={} dimensions={}x{}",
+                                frame.sequence(),
+                                frame.data().len(),
+                                sample,
+                                non_zero,
+                                frame.layout().size().width(),
+                                frame.layout().size().height()
+                            ),
+                        );
+                        decoded_logged = true;
+                    }
                     decode_total += decode_started.elapsed();
                     let present_started = Instant::now();
                     dc_media::FrameSink::present(&mut sink, frame)?;
                     present_total += present_started.elapsed();
                     receive_to_present_total += received.received_at.elapsed();
                     presented += 1;
+                }
+                if last_frame_progress.elapsed() >= Duration::from_secs(1)
+                    && last_keyframe_request
+                        .is_none_or(|time| time.elapsed() >= Duration::from_secs(2))
+                {
+                    control
+                        .send(&WireMessage::KeyframeRequest {
+                            last_sequence: last_sequence.unwrap_or_default(),
+                        })
+                        .await?;
+                    last_keyframe_request = Some(Instant::now());
+                    log(
+                        LogLevel::Debug,
+                        "direct-computing::stream-viewer",
+                        "no complete video frame received for 1s; requested keyframe",
+                    );
                 }
                 sink.pump_events();
                 if let Some((width, height)) = desktop_size {

@@ -241,6 +241,7 @@ version = "0.1.0"
 name = "dc-transport"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "dc-common",
  "dc-protocol",
  "quinn",
