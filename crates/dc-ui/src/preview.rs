@@ -1,11 +1,12 @@
 use dc_common::{DcError, Result};
 use dc_media::{FrameSink, PixelFormat, VideoFrame};
-use dc_platform::InputEventSource;
+use dc_platform::{local_screen_size, InputEventSource};
 use dc_protocol::InputEvent;
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
 
 const MAX_INITIAL_WIDTH: usize = 1_280;
 const MAX_INITIAL_HEIGHT: usize = 720;
+const WINDOW_DECORATION_HEIGHT: usize = 80;
 
 pub struct PreviewWindowSink {
     base_title: String,
@@ -196,6 +197,13 @@ impl FrameSink for PreviewWindowSink {
         let layout = frame.layout();
         let width = layout.size().width() as usize;
         let height = layout.size().height() as usize;
+        // The placeholder is only a bootstrap surface. Recreate it at the
+        // first decoded frame's native size so a fitting remote desktop is
+        // shown 1:1 instead of remaining a 640x360 scaled window.
+        if self.frame_size == Some((640, 360)) && (width, height) != (640, 360) {
+            self.window = None;
+            self.frame_size = None;
+        }
         self.ensure_window(width, height)?;
         self.frame_size = Some((width, height));
         convert_to_minifb(&frame, &mut self.pixels)?;
@@ -214,11 +222,18 @@ impl InputEventSource for PreviewWindowSink {
 }
 
 fn initial_window_size(width: usize, height: usize) -> (usize, usize) {
-    if width <= MAX_INITIAL_WIDTH && height <= MAX_INITIAL_HEIGHT {
+    let (max_width, max_height) = local_screen_size()
+        .map(|(screen_width, screen_height)| {
+            (
+                screen_width,
+                screen_height.saturating_sub(WINDOW_DECORATION_HEIGHT),
+            )
+        })
+        .unwrap_or((MAX_INITIAL_WIDTH, MAX_INITIAL_HEIGHT));
+    if width <= max_width && height <= max_height {
         return (width, height);
     }
-    let scale =
-        (MAX_INITIAL_WIDTH as f64 / width as f64).min(MAX_INITIAL_HEIGHT as f64 / height as f64);
+    let scale = (max_width as f64 / width as f64).min(max_height as f64 / height as f64);
     (
         (width as f64 * scale).round().max(1.0) as usize,
         (height as f64 * scale).round().max(1.0) as usize,
@@ -271,7 +286,15 @@ mod tests {
     #[test]
     fn preview_size_preserves_aspect_ratio() {
         assert_eq!(initial_window_size(640, 480), (640, 480));
-        assert_eq!(initial_window_size(3_840, 2_160), (1_280, 720));
+        let (width, height) = initial_window_size(3_840, 2_160);
+        assert!(width <= local_screen_size().map_or(MAX_INITIAL_WIDTH, |size| size.0));
+        assert!(
+            height
+                <= local_screen_size().map_or(MAX_INITIAL_HEIGHT, |size| {
+                    size.1.saturating_sub(WINDOW_DECORATION_HEIGHT)
+                })
+        );
+        assert_eq!(width * 2_160, height * 3_840);
     }
 
     #[test]

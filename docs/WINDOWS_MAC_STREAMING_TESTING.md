@@ -94,24 +94,37 @@ OpenH264. Treat fallback as a functional pass but not as a hardware-acceleration
 Viewer 启动后会先创建占位窗口。正常收到并重组首帧时，应依次看到类似日志：
 
 ```text
-received video datagram index=1 bytes=...
-received complete video frame after ... datagrams
+media protocol=hybrid-v2 host_hybrid_video=true video transport=hybrid-keyframe-stream+quic-datagram ...
 first encoded frame sequence=... keyframe=true ...
 first decoded frame sequence=... non_zero=... dimensions=...x...
+received video datagram index=1 bytes=...
+received first complete inter frame after ... datagrams
 presented=1 ...
 ```
+
+Host 同时应记录：
+
+```text
+media protocol=hybrid-v2 peer hybrid_video=true
+```
+
+若 Host 记录 `hybrid_video=false`，说明连接到的是旧 Viewer；Host 会自动退回
+Datagram 关键帧兼容路径。Viewer 等待可靠流超时也会明确记录 legacy fallback。
+不要用旧 EXE 的 `video transport=quic-datagram` 日志判断新实现是否生效。
 
 如果只有：
 
 ```text
-no complete video frame received for 1s; requested keyframe
+no complete video frame for 2s; requested keyframe bitrate=... fps=... incomplete_datagrams=true
 ```
 
-则问题仍在 Datagram 到达或分片重组阶段，不应先从窗口像素转换排查。Host 端的
-`sent=N` 只表示发送调用成功；还应记录：
+且 `incomplete_datagrams=true`，表示普通帧仍在 Datagram 到达或分片重组阶段丢失；Viewer
+会降低码率并要求 Host 通过可靠媒体 Stream 发送恢复关键帧。Host 端的 `sent=N` 只表示
+发送调用成功；还应观察：
 
 ```text
-first video frame sequence=... fragments=... datagram_size=...
+first video frame sequence=... bytes=... keyframe=true transport=reliable-stream
+video datagrams sent=... oversized_dropped=... recovery_wait_dropped=... bitrate=... fps=... rtt_ms=...
 ```
 
 用来与 Viewer 的 `received video datagram` 数量对照。Host 在静止桌面下可能记录：
@@ -139,14 +152,69 @@ cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<passwo
 - On Windows, a successful Media Foundation Viewer path reports
   `decoder backend=windows-media-foundation-h264-decoder`; NV12 output is copied
   into the shared BGRA frame model, so `zero_copy=false` is expected.
-- Video data uses QUIC DATAGRAM fragments. Missing or stale fragments may be
-  discarded; when a sequence gap or decode error is observed, the Viewer sends
-  a keyframe request and the Host resumes from a fresh IDR when supported.
-- A single lost fragment invalidates the whole encoded frame. For low-bandwidth or
-  lossy links, record the number of received fragments and completed frames; the
-  current DATAGRAM path repeats keyframe fragments once as a lightweight loss
-  mitigation, but it is not yet a reliable keyframe path. Reliable keyframe
-  delivery or FEC/fragment retransmission remains a planned improvement.
+- Initial and recovery keyframes use a dedicated reliable QUIC stream. Ordinary
+  frames use QUIC DATAGRAM fragments and may be discarded when incomplete or stale.
+- A single lost Datagram fragment invalidates an ordinary frame. The Host limits
+  ordinary frames to 96 fragments; larger frames are dropped and converted into a
+  reliable keyframe recovery instead of flooding a narrow link.
+- The low-bandwidth target preserves the captured resolution and uses 16-bit
+  RGB565-style color quantization before H.264 encoding. Pointer coordinates therefore
+  remain in the original desktop coordinate system. When Datagram fragments
+  continue arriving without a complete frame, the Viewer sends a rate hint that
+  steps down toward 96 Kbps / 4 FPS. The current low-bandwidth test profile starts at
+  96 Kbps / 4 FPS and can rise to 320 Kbps / 8 FPS after stable delivery. The Host also reduces the target immediately
+  when an inter frame exceeds the 96-fragment budget. A static desktop with no incoming Datagram
+  traffic is not treated as congestion.
+  The Viewer now starts at the profile floor (96 Kbps / 4 FPS for the normal
+  profile, 64 Kbps / 3 FPS for `--ultra-low`) and only raises the rate after a
+  stable run of complete inter frames. On Windows, the first decoded frame
+  recreates the placeholder window at native size when the remote dimensions
+  plus window decoration fit the local primary display.
+  The low profile applies aggressive 3-bit-per-channel color quantization
+  before H.264 encoding; `--ultra-low` uses 2-bit-per-channel quantization.
+  Spatial block averaging is intentionally disabled so text and small controls
+  remain readable while the source dimensions are preserved.
+  The Windows Host prefers a hardware Media Foundation H.264 MFT at every
+  profile rate. Its portable media-type bitrate is supplemented, when the MFT
+  exposes `ICodecAPI`, with CBR, mean/max bitrate, real-time, and low-latency
+  controls. These controls are best-effort because vendor MFTs expose
+  different subsets. A software-only MF MFT remains preferred when it is
+  available, because it is generally faster than the OpenH264 fallback in this
+  project. OpenH264 is used only when Media Foundation cannot initialize or
+  configure an H.264 MFT. The fallback uses QP 42..51 at the 64 Kbps floor and
+  QP 36..51 for the other low-quality rates, together with bitrate-mode and
+  low-complexity settings.
+  To test an even lower-quality profile without changing the captured resolution,
+  prepend `--ultra-low` to both commands. This profile starts at 64 Kbps / 3 FPS
+  and can rise to 160 Kbps / 5 FPS; omit the flag for the normal 96 Kbps / 4 FPS
+  low-bandwidth profile.
+- In the latest 96 Kbps test, the software-only Media Foundation MFT produced
+  inter frames of roughly 117–269 KB (103–237 Datagram fragments). Those frames
+  exceeded the 96-fragment guard, so the Host discarded them and requested a new
+  reliable keyframe. Initial frame presentation and keyframe ACK timing are now
+  acceptable, but this repeated oversized-inter-frame cycle remains the main
+  bandwidth/latency issue to solve. The run did not show connection loss or
+  decoder errors.
+- H.264 input is already 4:2:0 on both Windows Media Foundation and OpenH264 paths:
+  Media Foundation receives NV12, while OpenH264 converts BGRA/RGB input into its
+  internal YUV 4:2:0 representation. The 16-bit color-depth step is an additional
+  pre-quantization and does not replace chroma subsampling.
+- Reliable keyframe requests are coalesced until the Viewer acknowledges that the
+  current keyframe was decoded and presented. This prevents multiple large IDR frames
+  from accumulating behind one another on a narrow reliable stream.
+- The Viewer records the receive timestamp after a QUIC message has arrived, rather
+  than before waiting for the next message; this keeps `receive_to_present_avg` from
+  including idle time between frames. The Host also drops encoded frames that became
+  stale while a reliable keyframe was crossing a narrow link, so recovery resumes with
+  the newest available desktop state.
+- Capture sequence numbers are not used as transport sequence numbers. The Host
+  assigns a contiguous sequence only to packets that the encoder actually emits;
+  this prevents OpenH264/MFT frame skipping from being misclassified as network
+  loss by the Viewer.
+- While a hybrid reliable keyframe is queued or in flight, the Host pauses new
+  capture and encoding. It resumes only after the Viewer has decoded, presented,
+  and acknowledged that keyframe; ordinary frames therefore cannot accumulate
+  behind a recovery anchor.
 - Do not treat `presented=0` as a rendering failure until the Viewer has logged
   `received complete video frame`. If a complete frame is decoded but the window
   remains black, compare `non_zero` decoded bytes and then inspect pixel conversion
@@ -162,9 +230,9 @@ cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<passwo
   decoder backend, decode/present/receive-to-present timings, and any firewall or reconnect behavior.
 
 For low-bandwidth tests, also record the configured bitrate, frame rate, maximum Datagram size,
-fragment count per keyframe, completed/incomplete frame counts, keyframe request rate, and time
-from a request to the next successfully presented frame. Test at least one rate-limited and one
-lossy condition before considering the recovery path complete.
+Datagram count, oversized-frame drops, completed/incomplete ordinary frames, keyframe request
+rate, and time from a request to the next reliably received keyframe. Test at least one
+rate-limited and one lossy condition before considering the recovery path complete.
 
 This test demonstrates cross-platform stage 2 interoperability. It does not replace the remaining
 Windows ↔ Windows long-duration benchmark, multi-monitor validation, or a future native macOS Host

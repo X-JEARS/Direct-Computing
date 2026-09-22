@@ -83,4 +83,14 @@ impl EncodedVideoPacket {
     pub fn into_data(self) -> Vec<u8> {
         self.data
     }
+
+    /// Replace the transport sequence without changing the encoded payload.
+    ///
+    /// Capture sequence numbers are allowed to contain gaps when an encoder
+    /// skips a frame.  The transport must instead expose a sequence for each
+    /// packet that was actually emitted, so the viewer can distinguish an
+    /// encoder skip from a lost packet.
+    pub fn with_sequence(self, sequence: u64) -> Self {
+        Self { sequence, ..self }
+    }
 }

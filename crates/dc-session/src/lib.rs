@@ -17,6 +17,10 @@ pub enum SessionState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthenticatedSession {
     pub permissions: Permissions,
+    /// Capabilities advertised by the authenticated peer. Keeping this on
+    /// the session lets applications select compatible media lanes instead
+    /// of silently black-screening when an older client connects.
+    pub peer_capabilities: Capabilities,
 }
 
 pub async fn authenticate_server(
@@ -42,13 +46,20 @@ pub async fn authenticate_server(
             .await?;
         return Err(DcError::InvalidInput("authentication failed".into()));
     }
+    let mut advertised_permissions = permissions.to_capabilities();
+    // The authenticated envelope predates explicit media negotiation. Reuse
+    // the reserved high capability bit so new Viewers can discover the Host
+    // media lane while old Viewers continue to decode the byte unchanged.
+    advertised_permissions.hybrid_video = capabilities.hybrid_video;
     stream
         .send(&WireMessage::Authenticated {
-            permissions: permissions.to_capabilities(),
+            permissions: advertised_permissions,
         })
         .await?;
-    let _ = capabilities;
-    Ok(AuthenticatedSession { permissions })
+    Ok(AuthenticatedSession {
+        permissions,
+        peer_capabilities: hello.capabilities,
+    })
 }
 
 pub async fn authenticate_client(
@@ -77,6 +88,7 @@ pub async fn authenticate_client(
                 transfer_files: permissions.file_transfer,
                 ssh_access: permissions.ssh_compatibility,
             },
+            peer_capabilities: permissions,
         }),
         WireMessage::Rejected { reason } => Err(DcError::InvalidInput(reason)),
         _ => Err(DcError::Codec("expected authentication result".into())),

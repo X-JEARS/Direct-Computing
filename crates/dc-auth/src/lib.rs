@@ -47,6 +47,7 @@ impl Permissions {
             file_transfer: self.transfer_files,
             clipboard: false,
             ssh_compatibility: self.ssh_access,
+            hybrid_video: false,
         }
     }
 }

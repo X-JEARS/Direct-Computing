@@ -37,6 +37,9 @@ pub struct Capabilities {
     pub file_transfer: bool,
     pub clipboard: bool,
     pub ssh_compatibility: bool,
+    /// Supports reliable keyframes plus QUIC DATAGRAM inter frames.
+    /// Stored in the high bit so older peers continue to decode the byte.
+    pub hybrid_video: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -87,6 +90,11 @@ pub enum WireMessage {
     /// Ask the encoder to emit a fresh intra frame after a lossy media gap.
     KeyframeRequest {
         last_sequence: u64,
+    },
+    /// Confirms that a reliable recovery anchor was decoded and presented.
+    /// The Host uses this to avoid queuing duplicate keyframes on a narrow link.
+    KeyframeAck {
+        sequence: u64,
     },
     FileOffer {
         transfer_id: [u8; 16],
@@ -188,6 +196,10 @@ impl WireMessage {
             Self::KeyframeRequest { last_sequence } => {
                 output.push(14);
                 put_u64(&mut output, *last_sequence);
+            }
+            Self::KeyframeAck { sequence } => {
+                output.push(15);
+                put_u64(&mut output, *sequence);
             }
             Self::FileOffer {
                 transfer_id,
@@ -293,6 +305,9 @@ impl WireMessage {
             14 => Self::KeyframeRequest {
                 last_sequence: reader.u64()?,
             },
+            15 => Self::KeyframeAck {
+                sequence: reader.u64()?,
+            },
             10 => Self::FileOffer {
                 transfer_id: reader.array_16()?,
                 name: reader.string()?,
@@ -346,7 +361,8 @@ fn put_capabilities(out: &mut Vec<u8>, value: Capabilities) {
             | (u8::from(value.file_transfer) << 3)
             | (u8::from(value.clipboard) << 4)
             | (u8::from(value.ssh_compatibility) << 5)
-            | (u8::from(value.control_input) << 6),
+            | (u8::from(value.control_input) << 6)
+            | (u8::from(value.hybrid_video) << 7),
     );
 }
 fn put_bytes(out: &mut Vec<u8>, value: &[u8]) -> dc_common::Result<()> {
@@ -416,6 +432,7 @@ impl<'a> Reader<'a> {
             file_transfer: flags & 8 != 0,
             clipboard: flags & 16 != 0,
             ssh_compatibility: flags & 32 != 0,
+            hybrid_video: flags & 128 != 0,
         })
     }
 }
@@ -487,6 +504,15 @@ mod tests {
     }
 
     #[test]
+    fn keyframe_acknowledgements_round_trip() {
+        let message = WireMessage::KeyframeAck { sequence: 101 };
+        assert_eq!(
+            WireMessage::decode(&message.encode().unwrap()).unwrap(),
+            message
+        );
+    }
+
+    #[test]
     fn file_messages_round_trip_with_checksums() {
         let message = WireMessage::FileChunk {
             transfer_id: [7; 16],
@@ -506,6 +532,7 @@ mod tests {
             permissions: Capabilities {
                 desktop: true,
                 control_input: true,
+                hybrid_video: true,
                 ..Capabilities::default()
             },
         };

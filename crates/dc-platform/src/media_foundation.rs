@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use windows::core::{Interface, GUID};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
 
 const HNS_PER_SECOND: u64 = 10_000_000;
 
@@ -362,6 +363,10 @@ fn configure_transform(
                 })?;
         }
     }
+    // IMFTransform exposes codec-specific controls through ICodecAPI.  These
+    // controls are optional across GPU vendors, so apply them best-effort and
+    // keep the media-type bitrate as the portable fallback.
+    configure_codec_api(transform, bitrate);
     let input = input_media_type(width, height, frames_per_second)?;
     let output = output_media_type(width, height, bitrate, frames_per_second)?;
     unsafe {
@@ -374,6 +379,10 @@ fn configure_transform(
         transform
             .SetInputType(0, &input, 0)
             .map_err(|error| mf_stage_error("set Media Foundation input type", error))?;
+        // A number of vendor MFTs only expose ICodecAPI after their media
+        // types have been selected. Repeat the best-effort controls here so
+        // those encoders receive the same low-bandwidth policy.
+        configure_codec_api(transform, bitrate);
         transform
             .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
             .map_err(|error| mf_stage_error("begin Media Foundation streaming", error))?;
@@ -382,6 +391,38 @@ fn configure_transform(
             .map_err(|error| mf_stage_error("start Media Foundation stream", error))?;
     }
     Ok(asynchronous)
+}
+
+fn configure_codec_api(transform: &IMFTransform, bitrate: u32) {
+    let Ok(codec_api) = transform.cast::<ICodecAPI>() else {
+        return;
+    };
+    // CBR and a matching mean/max bitrate keep hardware encoders from
+    // producing an oversized IDR burst when a low-bandwidth profile is active.
+    let _ = set_codec_u32(
+        &codec_api,
+        &CODECAPI_AVEncCommonRateControlMode,
+        eAVEncCommonRateControlMode_CBR.0 as u32,
+    );
+    let _ = set_codec_u32(&codec_api, &CODECAPI_AVEncCommonMeanBitRate, bitrate);
+    let _ = set_codec_u32(&codec_api, &CODECAPI_AVEncCommonMaxBitRate, bitrate);
+    let _ = set_codec_u32(&codec_api, &CODECAPI_AVEncCommonLowLatency, 1);
+    let _ = set_codec_u32(&codec_api, &CODECAPI_AVEncCommonRealTime, 1);
+}
+
+fn set_codec_u32(codec_api: &ICodecAPI, key: &GUID, value: u32) -> windows::core::Result<()> {
+    let mut variant = VARIANT {
+        Anonymous: VARIANT_0 {
+            Anonymous: ManuallyDrop::new(VARIANT_0_0 {
+                vt: VT_UI4,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: VARIANT_0_0_0 { uintVal: value },
+            }),
+        },
+    };
+    unsafe { codec_api.SetValue(key, &mut variant) }
 }
 
 fn video_media_type(

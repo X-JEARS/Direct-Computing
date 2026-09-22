@@ -243,8 +243,8 @@ impl FramedStream {
     }
 }
 
-fn map_quic_io(error: impl std::fmt::Display) -> DcError {
-    DcError::Io(std::io::Error::other(error.to_string()))
+fn map_quic_io(error: impl std::fmt::Display + std::fmt::Debug) -> DcError {
+    DcError::Io(std::io::Error::other(format!("{error} ({error:?})")))
 }
 
 fn streaming_transport_config() -> Result<Arc<TransportConfig>> {
@@ -255,7 +255,10 @@ fn streaming_transport_config() -> Result<Arc<TransportConfig>> {
     config.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
     config.datagram_send_buffer_size(2 * 1024 * 1024);
     config.keep_alive_interval(Some(Duration::from_secs(2)));
-    let idle_timeout = Duration::from_secs(10)
+    // A low-bandwidth recovery keyframe can legitimately take tens of seconds
+    // to cross a lossy path. Keep input/control alive across that stall instead
+    // of treating it as a dead peer after only ten seconds.
+    let idle_timeout = Duration::from_secs(60)
         .try_into()
         .map_err(|error| DcError::InvalidInput(format!("invalid QUIC idle timeout: {error}")))?;
     config.max_idle_timeout(Some(idle_timeout));
@@ -495,7 +498,7 @@ mod tests {
 }
 
 #[test]
-fn datagrams_round_trip_between_configured_peers() {
+fn reliable_stream_and_datagram_lanes_coexist() {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -509,6 +512,13 @@ fn datagrams_round_trip_between_configured_peers() {
             let server_connection = server_task.await.unwrap();
             let max_size = client_connection.max_datagram_size().unwrap();
             assert!(max_size >= 1_000);
+            let reliable_receiver = server_connection.clone();
+            let reliable_task = tokio::spawn(async move {
+                let mut stream = reliable_receiver.accept_stream().await.unwrap();
+                stream.receive().await.unwrap()
+            });
+            let mut reliable_stream = client_connection.open_stream().await.unwrap();
+            reliable_stream.send(&WireMessage::Close).await.unwrap();
             client_connection
                 .send_datagram(Bytes::from_static(b"datagram-test"))
                 .unwrap();
@@ -518,5 +528,6 @@ fn datagrams_round_trip_between_configured_peers() {
                     .unwrap()
                     .unwrap();
             assert_eq!(&received[..], b"datagram-test");
+            assert_eq!(reliable_task.await.unwrap(), WireMessage::Close);
         });
 }

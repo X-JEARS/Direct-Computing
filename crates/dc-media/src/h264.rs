@@ -4,7 +4,10 @@ use crate::{
 };
 use dc_common::{DcError, Result};
 use openh264::decoder::Decoder;
-use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, FrameType, UsageType};
+use openh264::encoder::{
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, QpRange, RateControlMode,
+    UsageType,
+};
 use openh264::formats::{BgraSliceU8, RgbSliceU8, YUVBuffer, YUVSource};
 use openh264::{OpenH264API, Timestamp};
 
@@ -14,6 +17,18 @@ pub struct OpenH264Encoder {
 
 impl OpenH264Encoder {
     pub fn new(target_bitrate: u32, frames_per_second: f32) -> Result<Self> {
+        Self::new_with_qp(target_bitrate, frames_per_second, None)
+    }
+
+    /// Create a screen encoder with an optional explicit quantizer range.
+    /// Media Foundation's average bitrate is not a hard per-frame quality
+    /// control, so narrow-band profiles use this path to force visibly lower
+    /// quality and smaller IDR frames.
+    pub fn new_with_qp(
+        target_bitrate: u32,
+        frames_per_second: f32,
+        qp_range: Option<QpRange>,
+    ) -> Result<Self> {
         if target_bitrate == 0 {
             return Err(DcError::InvalidInput(
                 "H.264 target bitrate must be non-zero".into(),
@@ -24,16 +39,37 @@ impl OpenH264Encoder {
                 "H.264 frame rate must be finite and greater than zero".into(),
             ));
         }
-        let config = EncoderConfig::new()
+        let mut config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(target_bitrate))
             .max_frame_rate(FrameRate::from_hz(frames_per_second))
             .usage_type(UsageType::ScreenContentRealTime)
+            // The target bitrate is a network budget, not just a quality hint.
+            // Bitrate mode prevents large quality-mode bursts and low
+            // complexity keeps the software fallback from monopolising the
+            // capture thread at full desktop resolution.
+            .rate_control_mode(RateControlMode::Bitrate)
+            .complexity(Complexity::Low)
             .skip_frames(true)
             .adaptive_quantization(false)
             .background_detection(false);
+        if let Some(qp_range) = qp_range {
+            config = config.qp(qp_range);
+        }
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
             .map_err(|error| DcError::Codec(error.to_string()))?;
         Ok(Self { encoder })
+    }
+
+    pub fn new_low_quality(
+        target_bitrate: u32,
+        frames_per_second: f32,
+        minimum_qp: u8,
+    ) -> Result<Self> {
+        Self::new_with_qp(
+            target_bitrate,
+            frames_per_second,
+            Some(QpRange::new(minimum_qp.min(51), 51)),
+        )
     }
 }
 

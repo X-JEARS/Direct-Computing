@@ -5,8 +5,8 @@ use dc_desktop::{packet_to_message, packetize_video_message, VideoDatagramReasse
 #[cfg(target_os = "windows")]
 use dc_media::{write_bmp, LastFrameSink};
 use dc_media::{
-    ChecksumSink, FrameSize, LoopbackPipeline, OpenH264Decoder, OpenH264Encoder,
-    SyntheticFrameSource,
+    ChecksumSink, FrameSize, LoopbackPipeline, OpenH264Decoder, OpenH264Encoder, PixelFormat,
+    SyntheticFrameSource, VideoEncoder, VideoFrame,
 };
 #[cfg(target_os = "macos")]
 use dc_platform::VideoToolboxH264Decoder;
@@ -22,9 +22,140 @@ use dc_session::{authenticate_client, authenticate_server};
 use dc_transport::{format_fingerprint, parse_fingerprint, QuicClient, QuicConnection, QuicServer};
 use dc_ui::PreviewWindowSink;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+// The encoder's bitrate is an average target; keyframes can still be larger.
+#[derive(Clone, Copy, Debug)]
+struct RateProfile {
+    name: &'static str,
+    initial_bitrate: u32,
+    initial_fps: u32,
+    min_bitrate: u32,
+    min_fps: u32,
+    max_bitrate: u32,
+    max_fps: u32,
+    color_masks: [u8; 3],
+}
+
+const LOW_RATE_PROFILE: RateProfile = RateProfile {
+    name: "low",
+    initial_bitrate: 96_000,
+    initial_fps: 4,
+    min_bitrate: 96_000,
+    min_fps: 4,
+    max_bitrate: 320_000,
+    max_fps: 8,
+    color_masks: [0xE0, 0xE0, 0xE0],
+};
+
+const ULTRA_LOW_RATE_PROFILE: RateProfile = RateProfile {
+    name: "ultra-low",
+    initial_bitrate: 64_000,
+    initial_fps: 3,
+    min_bitrate: 64_000,
+    min_fps: 3,
+    max_bitrate: 160_000,
+    max_fps: 5,
+    color_masks: [0xC0, 0xC0, 0xC0],
+};
+const NETWORK_MAX_BITRATE: u32 = 4_000_000;
+const NETWORK_MAX_FPS: u32 = 30;
+const RATE_UPGRADE_INTERVAL: Duration = Duration::from_secs(5);
+const RATE_UPGRADE_MIN_INTER_FRAMES: u32 = 8;
+// At 1440x900, even a low-bitrate H.264 inter frame can occupy 60-90 MTU
+// fragments.  A cap of 32 rejected nearly every changed desktop frame and
+// forced another large reliable keyframe, which is disastrous on a narrow
+// link.  QUIC still bounds the datagram queue and the Viewer discards an
+// incomplete/stale frame, so allowing up to 96 fragments is latency-oriented
+// rather than a reliable-frame guarantee.
+const MAX_DATAGRAM_FRAGMENTS_PER_FRAME: usize = 96;
+const STARTUP_ZERO_FRAME_GRACE: Duration = Duration::from_secs(2);
+const NETWORK_COLOR_DEPTH_BITS: u8 = 16;
+const NETWORK_CHROMA_SUBSAMPLING: &str = "4:2:0";
+const MEDIA_PROTOCOL_REVISION: &str = "hybrid-v2";
+
+struct StreamControl {
+    profile: RateProfile,
+    keyframe_requested: AtomicBool,
+    recovery_pending: AtomicBool,
+    shutdown: AtomicBool,
+    target_bitrate: AtomicU32,
+    target_fps: AtomicU32,
+}
+
+impl StreamControl {
+    const fn new(profile: RateProfile) -> Self {
+        Self {
+            profile,
+            keyframe_requested: AtomicBool::new(false),
+            recovery_pending: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            target_bitrate: AtomicU32::new(profile.initial_bitrate),
+            target_fps: AtomicU32::new(profile.initial_fps),
+        }
+    }
+
+    fn update_rate(&self, bitrate: u32, frames_per_second: u16) {
+        self.target_bitrate.store(
+            bitrate.clamp(
+                self.profile.min_bitrate,
+                self.profile.max_bitrate.min(NETWORK_MAX_BITRATE),
+            ),
+            Ordering::Release,
+        );
+        self.target_fps.store(
+            u32::from(frames_per_second).clamp(
+                self.profile.min_fps,
+                self.profile.max_fps.min(NETWORK_MAX_FPS),
+            ),
+            Ordering::Release,
+        );
+    }
+
+    fn reduce_rate(&self) -> (u32, u16) {
+        let current_bitrate = self.target_bitrate.load(Ordering::Acquire);
+        let current_fps = self.target_fps.load(Ordering::Acquire) as u16;
+        let (bitrate, fps) = reduce_stream_rate(
+            current_bitrate,
+            current_fps,
+            self.profile.min_bitrate,
+            self.profile.min_fps,
+        );
+        self.update_rate(bitrate, fps);
+        (bitrate, fps)
+    }
+
+    fn request_keyframe(&self) -> bool {
+        if self
+            .recovery_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.keyframe_requested.store(true, Ordering::Release);
+        true
+    }
+
+    fn request_lower_rate_keyframe(&self) -> Option<(u32, u16)> {
+        if self
+            .recovery_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        let rate = self.reduce_rate();
+        self.keyframe_requested.store(true, Ordering::Release);
+        Some(rate)
+    }
+
+    fn acknowledge_keyframe(&self) {
+        self.recovery_pending.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone)]
 struct EncodedFrame {
@@ -49,7 +180,15 @@ fn main() {
     }
 }
 
-fn run(mut arguments: impl Iterator<Item = String>) -> Result<()> {
+fn run(arguments: impl Iterator<Item = String>) -> Result<()> {
+    let mut arguments = arguments.collect::<Vec<_>>();
+    let profile = if arguments.first().map(String::as_str) == Some("--ultra-low") {
+        arguments.remove(0);
+        ULTRA_LOW_RATE_PROFILE
+    } else {
+        LOW_RATE_PROFILE
+    };
+    let mut arguments = arguments.into_iter();
     match arguments.next().as_deref() {
         None => {
             log(
@@ -111,7 +250,7 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<()> {
             if arguments.next().is_some() {
                 return Err(DcError::InvalidInput(usage().into()));
             }
-            run_network_host(&address, &password)
+            run_network_host(&address, &password, profile)
         }
         Some("--connect") => {
             let address = arguments
@@ -124,7 +263,7 @@ fn run(mut arguments: impl Iterator<Item = String>) -> Result<()> {
             if arguments.next().is_some() {
                 return Err(DcError::InvalidInput(usage().into()));
             }
-            run_network_viewer(&address, &password, fingerprint.as_deref())
+            run_network_viewer(&address, &password, fingerprint.as_deref(), profile)
         }
         Some(argument) => Err(DcError::InvalidInput(format!(
             "unknown argument {argument}; {}",
@@ -153,10 +292,10 @@ where
 }
 
 const fn usage() -> &'static str {
-    "usage: direct-computing [--host [addr] <password> | --connect <addr> <password> [cert-sha256] | --loopback [frame-count] | --window-test [duration-seconds] | --capture-test [frame-count] [display-index] [output.bmp] | --preview [display-index] [duration-seconds]]"
+    "usage: direct-computing [--ultra-low] [--host [addr] <password> | --connect <addr> <password> [cert-sha256] | --loopback [frame-count] | --window-test [duration-seconds] | --capture-test [frame-count] [display-index] [output.bmp] | --preview [display-index] [duration-seconds]]"
 }
 
-fn run_network_host(address: &str, password: &str) -> Result<()> {
+fn run_network_host(address: &str, password: &str, profile: RateProfile) -> Result<()> {
     let address = address
         .parse()
         .map_err(|_| DcError::InvalidInput(format!("invalid host address: {address}")))?;
@@ -183,31 +322,49 @@ fn run_network_host(address: &str, password: &str) -> Result<()> {
                 control_input: true,
                 ..Permissions::empty()
             };
-            authenticate_server(
+            let session = authenticate_server(
                 &mut control,
                 &verifier,
                 permissions,
                 Capabilities {
                     desktop: true,
                     control_input: true,
+                    hybrid_video: true,
                     ..Capabilities::default()
                 },
             )
             .await?;
+            let hybrid_video = session.peer_capabilities.hybrid_video;
+            log(
+                LogLevel::Info,
+                "direct-computing::host",
+                &format!(
+                    "media protocol={} peer hybrid_video={} (client build must support reliable keyframes)",
+                    MEDIA_PROTOCOL_REVISION, hybrid_video
+                ),
+            );
             control.send(&WireMessage::OpenDesktop).await?;
-            let keyframe_requested = Arc::new(AtomicBool::new(false));
-            let input_keyframe_requested = keyframe_requested.clone();
+            let stream_control = Arc::new(StreamControl::new(profile));
+            let input_stream_control = stream_control.clone();
             tokio::spawn(async move {
-                if let Err(error) = receive_host_input(&mut control, input_keyframe_requested).await
-                {
-                    log(
+                let result = receive_host_input(&mut control, input_stream_control.clone()).await;
+                input_stream_control
+                    .shutdown
+                    .store(true, Ordering::Release);
+                match result {
+                    Ok(()) => log(
+                        LogLevel::Info,
+                        "direct-computing::host",
+                        "client requested stream shutdown",
+                    ),
+                    Err(error) => log(
                         LogLevel::Warn,
                         "direct-computing::host",
                         &format!("input stream closed: {error}"),
-                    );
+                    ),
                 }
             });
-            let result = send_desktop_frames(&connection, keyframe_requested).await;
+            let result = send_desktop_frames(&connection, stream_control, hybrid_video, profile).await;
             if let Err(error) = &result {
                 log(
                     LogLevel::Error,
@@ -223,16 +380,35 @@ fn run_network_host(address: &str, password: &str) -> Result<()> {
 #[cfg(target_os = "windows")]
 async fn receive_host_input(
     stream: &mut dc_transport::FramedStream,
-    keyframe_requested: Arc<AtomicBool>,
+    stream_control: Arc<StreamControl>,
 ) -> Result<()> {
     let mut injector = WindowsInputInjector::new();
     loop {
         match stream.receive().await? {
-            WireMessage::Input(event) => injector.inject(&event)?,
-            WireMessage::KeyframeRequest { .. } => {
-                keyframe_requested.store(true, Ordering::Release);
+            WireMessage::Input(event) => {
+                injector.inject(&event)?;
             }
-            WireMessage::Close => return Ok(()),
+            WireMessage::KeyframeRequest { .. } => {
+                stream_control.request_keyframe();
+            }
+            WireMessage::KeyframeAck { sequence } => {
+                stream_control.acknowledge_keyframe();
+                log(
+                    LogLevel::Debug,
+                    "direct-computing::stream-host",
+                    &format!("viewer acknowledged keyframe sequence={sequence}; resuming capture"),
+                );
+            }
+            WireMessage::RateHint {
+                bitrate,
+                frames_per_second,
+            } => {
+                stream_control.update_rate(bitrate, frames_per_second);
+            }
+            WireMessage::Close => {
+                stream_control.shutdown.store(true, Ordering::Release);
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -241,7 +417,7 @@ async fn receive_host_input(
 #[cfg(not(target_os = "windows"))]
 async fn receive_host_input(
     stream: &mut dc_transport::FramedStream,
-    keyframe_requested: Arc<AtomicBool>,
+    stream_control: Arc<StreamControl>,
 ) -> Result<()> {
     loop {
         match stream.receive().await? {
@@ -251,9 +427,21 @@ async fn receive_host_input(
                 ));
             }
             WireMessage::KeyframeRequest { .. } => {
-                keyframe_requested.store(true, Ordering::Release);
+                stream_control.request_keyframe();
             }
-            WireMessage::Close => return Ok(()),
+            WireMessage::KeyframeAck { .. } => {
+                stream_control.acknowledge_keyframe();
+            }
+            WireMessage::RateHint {
+                bitrate,
+                frames_per_second,
+            } => {
+                stream_control.update_rate(bitrate, frames_per_second);
+            }
+            WireMessage::Close => {
+                stream_control.shutdown.store(true, Ordering::Release);
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -262,67 +450,140 @@ async fn receive_host_input(
 #[cfg(target_os = "windows")]
 async fn send_desktop_frames(
     connection: &QuicConnection,
-    keyframe_requested: Arc<AtomicBool>,
+    stream_control: Arc<StreamControl>,
+    hybrid_video: bool,
+    profile: RateProfile,
 ) -> Result<()> {
     let source = WindowsDesktopCapturer::new(0, 1_000)?;
-    send_frames_from(connection, keyframe_requested, source, |frame| {
-        let size = frame.layout().size();
-        match WindowsMediaFoundationH264Encoder::new(size.width(), size.height(), 8_000_000, 30) {
-            Ok(encoder) => Ok(Box::new(encoder)),
-            Err(error) => {
-                log(
-                    LogLevel::Warn,
-                    "direct-computing::stream-host",
-                    &format!("Media Foundation unavailable, using OpenH264: {error}"),
-                );
-                Ok(Box::new(OpenH264Encoder::new(2_000_000, 30.0)?))
+    send_frames_from(
+        connection,
+        stream_control,
+        source,
+        hybrid_video,
+        profile,
+        |frame, bitrate, fps| {
+            let size = frame.layout().size();
+            // Prefer the vendor-provided Media Foundation encoder at every
+            // bitrate.  It is hardware accelerated when the host exposes a
+            // compatible MFT and has much lower encode latency than the
+            // software fallback.  OpenH264 remains the fallback if the MFT is
+            // unavailable or rejects the requested profile.
+            match WindowsMediaFoundationH264Encoder::new(size.width(), size.height(), bitrate, fps)
+            {
+                Ok(encoder) => {
+                    if !encoder.capabilities().hardware_accelerated {
+                        // Keep a software MF MFT ahead of OpenH264: on this
+                        // project it is typically faster even when its output
+                        // is less bandwidth-efficient.
+                        log(
+                            LogLevel::Warn,
+                            "direct-computing::stream-host",
+                            "Media Foundation H.264 MFT is software-only; keeping it as the preferred software backend",
+                        );
+                    }
+                    Ok(Box::new(encoder))
+                }
+                Err(error) => {
+                    log(
+                        LogLevel::Warn,
+                        "direct-computing::stream-host",
+                        &format!("Media Foundation unavailable, using OpenH264 fallback: {error}"),
+                    );
+                    let minimum_qp = if bitrate <= 64_000 { 42 } else { 36 };
+                    log(
+                        LogLevel::Info,
+                        "direct-computing::stream-host",
+                        &format!(
+                            "using OpenH264 low-quality fallback bitrate={} fps={} qp={}..51",
+                            bitrate, fps, minimum_qp
+                        ),
+                    );
+                    Ok(Box::new(OpenH264Encoder::new_low_quality(
+                        bitrate, fps as f32, minimum_qp,
+                    )?))
+                }
             }
-        }
-    })
+        },
+    )
     .await
 }
 
 #[cfg(not(target_os = "windows"))]
 async fn send_desktop_frames(
     connection: &QuicConnection,
-    keyframe_requested: Arc<AtomicBool>,
+    stream_control: Arc<StreamControl>,
+    hybrid_video: bool,
+    profile: RateProfile,
 ) -> Result<()> {
     let size = FrameSize::new(640, 360)?;
     send_frames_from(
         connection,
-        keyframe_requested,
+        stream_control,
         SyntheticFrameSource::new(size, 30)?,
-        |_| Ok(Box::new(OpenH264Encoder::new(2_000_000, 30.0)?)),
+        hybrid_video,
+        profile,
+        |_, bitrate, fps| Ok(Box::new(OpenH264Encoder::new(bitrate, fps as f32)?)),
     )
     .await
 }
 
 async fn send_frames_from<S, F>(
     connection: &QuicConnection,
-    keyframe_requested: Arc<AtomicBool>,
+    stream_control: Arc<StreamControl>,
     mut source: S,
+    hybrid_video: bool,
+    profile: RateProfile,
     create_encoder: F,
 ) -> Result<()>
 where
     S: dc_media::FrameSource + Send + 'static,
-    F: Fn(&dc_media::VideoFrame) -> Result<Box<dyn dc_media::VideoEncoder>> + Send + 'static,
+    F: Fn(&dc_media::VideoFrame, u32, u32) -> Result<Box<dyn dc_media::VideoEncoder>>
+        + Send
+        + 'static,
 {
     let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
         DcError::Unsupported("peer did not negotiate QUIC DATAGRAM support".into())
     })?;
+    // Keyframes are decoder recovery anchors. Carry them on a dedicated
+    // reliable QUIC stream; ordinary inter frames stay on the lossy Datagram
+    // lane so stale video never blocks input/control traffic.
+    let mut keyframe_stream = if hybrid_video {
+        Some(connection.open_stream().await?)
+    } else {
+        None
+    };
     // Keep capture and encoding off the async runtime thread. The bounded
     // producer queue protects the runtime, while the datagram lane allows the
     // transport to discard stale media instead of blocking control traffic.
-    let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<Arc<EncodedFrame>>(4);
+    let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<Arc<EncodedFrame>>(1);
+    let producer_control = stream_control.clone();
+    let producer_hybrid_video = hybrid_video;
     let producer = tokio::task::spawn_blocking(move || -> Result<()> {
         use dc_media::EncodeOutcome;
         let first_capture_started = Instant::now();
+        let mut zero_frame_candidate = None;
         let first_frame = loop {
             match source.capture() {
+                Ok(frame)
+                    if is_effectively_zero_frame(&frame)
+                        && first_capture_started.elapsed() < STARTUP_ZERO_FRAME_GRACE =>
+                {
+                    zero_frame_candidate = Some(frame);
+                }
+                Ok(frame) => break frame,
+                Err(DcError::Timeout(_))
+                    if first_capture_started.elapsed() >= STARTUP_ZERO_FRAME_GRACE
+                        && zero_frame_candidate.is_some() =>
+                {
+                    break zero_frame_candidate
+                        .take()
+                        .expect("zero-frame candidate was checked");
+                }
                 Err(DcError::Timeout(_)) => continue,
-                result => break result?,
+                Err(error) => return Err(error),
             }
         };
+        let first_frame = prepare_network_frame(first_frame, profile)?;
         let mut pending = (first_frame, first_capture_started.elapsed());
         let first_source_non_zero = pending.0.data().iter().filter(|byte| **byte > 4).count();
         let first_source_sample = pending
@@ -335,15 +596,18 @@ where
             LogLevel::Info,
             "direct-computing::stream-host",
             &format!(
-                "first captured frame sequence={} sample_sum={} non_zero={} dimensions={}x{}",
+                "first captured frame sequence={} sample_sum={} non_zero={} dimensions={}x{} color_depth={}bit",
                 pending.0.sequence(),
                 first_source_sample,
                 first_source_non_zero,
                 pending.0.layout().size().width(),
-                pending.0.layout().size().height()
+                pending.0.layout().size().height(),
+                NETWORK_COLOR_DEPTH_BITS
             ),
         );
-        let mut encoder = create_encoder(&pending.0)?;
+        let mut current_bitrate = producer_control.target_bitrate.load(Ordering::Acquire);
+        let mut current_fps = producer_control.target_fps.load(Ordering::Acquire);
+        let mut encoder = create_encoder(&pending.0, current_bitrate, current_fps)?;
         let mut last_frame;
         let mut last_sequence;
         let capabilities = encoder.capabilities();
@@ -351,27 +615,78 @@ where
             LogLevel::Info,
             "direct-computing::stream-host",
             &format!(
-                "encoder backend={} hardware={} zero_copy={} low_latency={}",
+                "encoder backend={} hardware={} zero_copy={} low_latency={} profile={} bitrate={} fps={}",
                 capabilities.backend,
                 capabilities.hardware_accelerated,
                 capabilities.zero_copy_input,
-                capabilities.low_latency
+                capabilities.low_latency,
+                profile.name,
+                current_bitrate,
+                current_fps
             ),
         );
-        let frame_interval = Duration::from_secs_f64(1.0 / 30.0);
+        log(
+            LogLevel::Info,
+            "direct-computing::stream-host",
+            &format!(
+                "video format=H.264 chroma={} color_depth={}bit",
+                NETWORK_CHROMA_SUBSAMPLING, NETWORK_COLOR_DEPTH_BITS
+            ),
+        );
+        let mut frame_interval = Duration::from_secs_f64(1.0 / f64::from(current_fps));
         let mut next_frame_at = std::time::Instant::now();
         let mut report_started = Instant::now();
         let mut captured = 0_u64;
         let mut encoded = 0_u64;
+        let mut media_sequence = 0_u64;
         let mut capture_total = Duration::ZERO;
         let mut encode_total = Duration::ZERO;
+        let mut queue_dropped = 0_u64;
         loop {
+            if producer_control.shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            // A reliable keyframe is the decoder's recovery barrier. Once it
+            // has been emitted, do not process another desktop state until the
+            // Viewer has decoded and acknowledged it. A pending request still
+            // allows this iteration to produce the requested keyframe.
+            while producer_hybrid_video
+                && producer_control.recovery_pending.load(Ordering::Acquire)
+                && !producer_control.keyframe_requested.load(Ordering::Acquire)
+            {
+                if producer_control.shutdown.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
             let (frame, capture_time) = pending;
             captured += 1;
             capture_total += capture_time;
             let recovery_frame = frame.clone();
             last_sequence = frame.sequence();
-            if keyframe_requested.swap(false, Ordering::AcqRel) {
+            let target_bitrate = producer_control.target_bitrate.load(Ordering::Acquire);
+            let target_fps = producer_control.target_fps.load(Ordering::Acquire);
+            let settings_changed = target_bitrate != current_bitrate || target_fps != current_fps;
+            if settings_changed {
+                current_bitrate = target_bitrate;
+                current_fps = target_fps;
+                frame_interval = Duration::from_secs_f64(1.0 / f64::from(current_fps));
+                encoder = create_encoder(&frame, current_bitrate, current_fps)?;
+                producer_control
+                    .keyframe_requested
+                    .store(false, Ordering::Release);
+                log(
+                    LogLevel::Info,
+                    "direct-computing::stream-host",
+                    &format!(
+                        "adapted encoder bitrate={} fps={}",
+                        current_bitrate, current_fps
+                    ),
+                );
+            } else if producer_control
+                .keyframe_requested
+                .swap(false, Ordering::AcqRel)
+            {
                 if let Err(error) = encoder.force_keyframe() {
                     log(
                         LogLevel::Debug,
@@ -382,7 +697,7 @@ where
                     // portable force-IDR control. Recreating the encoder
                     // resets its GOP and guarantees that the next packet is
                     // independently decodable.
-                    encoder = create_encoder(&frame)?;
+                    encoder = create_encoder(&frame, current_bitrate, current_fps)?;
                 }
             }
             let encode_started = Instant::now();
@@ -390,17 +705,56 @@ where
                 let encode_time = encode_started.elapsed();
                 encode_total += encode_time;
                 encoded += 1;
-                if packet_tx
-                    .blocking_send(Arc::new(EncodedFrame {
-                        sequence: packet.sequence(),
-                        encoded_bytes: packet.data().len() as u64,
-                        capture_time,
-                        encode_time,
-                        message: Arc::new(packet_to_message(&packet)?),
-                    }))
-                    .is_err()
-                {
-                    return Ok(());
+                // The source sequence advances for every capture attempt, but
+                // OpenH264/MFT may intentionally skip a frame.  Renumber only
+                // packets that really leave the encoder; otherwise the viewer
+                // mistakes encoder skips for network loss and requests a large
+                // reliable keyframe unnecessarily.
+                let packet = packet.with_sequence(media_sequence);
+                media_sequence = media_sequence.wrapping_add(1);
+                let keyframe = packet.is_keyframe();
+                let encoded_frame = Arc::new(EncodedFrame {
+                    sequence: packet.sequence(),
+                    encoded_bytes: packet.data().len() as u64,
+                    capture_time,
+                    encode_time,
+                    message: Arc::new(packet_to_message(&packet)?),
+                });
+                if keyframe && producer_hybrid_video {
+                    // A recovery anchor must never be discarded because the
+                    // queue currently contains an ordinary frame. Mark the
+                    // barrier before enqueueing so no later capture can race
+                    // ahead of the reliable keyframe.
+                    producer_control
+                        .recovery_pending
+                        .store(true, Ordering::Release);
+                    log(
+                        LogLevel::Debug,
+                        "direct-computing::stream-host",
+                        &format!(
+                            "keyframe queued sequence={}; pausing capture until Viewer acknowledgement",
+                            packet.sequence()
+                        ),
+                    );
+                    if packet_tx.blocking_send(encoded_frame).is_err() {
+                        producer_control
+                            .recovery_pending
+                            .store(false, Ordering::Release);
+                        return Ok(());
+                    }
+                } else {
+                    match packet_tx.try_send(encoded_frame) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            // Ordinary frames remain latest-frame oriented;
+                            // dropping them is preferable to queueing stale
+                            // desktop state behind a slow network.
+                            queue_dropped = queue_dropped.saturating_add(1);
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            return Ok(());
+                        }
+                    }
                 }
             }
             last_frame = Some(recovery_frame);
@@ -409,15 +763,17 @@ where
                     LogLevel::Info,
                     "direct-computing::stream-host",
                     &format!(
-                        "capture={} encoded={} capture_avg={:.2}ms encode_avg={:.2}ms",
+                        "capture={} encoded={} queue_dropped={} capture_avg={:.2}ms encode_avg={:.2}ms",
                         captured,
                         encoded,
+                        queue_dropped,
                         average_millis(capture_total, captured),
                         average_millis(encode_total, encoded)
                     ),
                 );
                 captured = 0;
                 encoded = 0;
+                queue_dropped = 0;
                 capture_total = Duration::ZERO;
                 encode_total = Duration::ZERO;
                 report_started = Instant::now();
@@ -429,10 +785,26 @@ where
             } else {
                 next_frame_at = now;
             }
+            while producer_hybrid_video
+                && producer_control.recovery_pending.load(Ordering::Acquire)
+                && !producer_control.keyframe_requested.load(Ordering::Acquire)
+            {
+                if producer_control.shutdown.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
             let capture_started = Instant::now();
             pending = loop {
                 match source.capture() {
-                    Err(DcError::Timeout(_)) if keyframe_requested.load(Ordering::Acquire) => {
+                    Err(DcError::Timeout(_))
+                        if producer_control.shutdown.load(Ordering::Acquire) =>
+                    {
+                        return Ok(())
+                    }
+                    Err(DcError::Timeout(_))
+                        if producer_control.keyframe_requested.load(Ordering::Acquire) =>
+                    {
                         let previous = last_frame.as_ref().ok_or_else(|| {
                             DcError::Platform(
                                 "keyframe requested before a recoverable frame existed".into(),
@@ -464,7 +836,10 @@ where
                         break (recovered, Duration::ZERO);
                     }
                     Err(DcError::Timeout(_)) => continue,
-                    result => break (result?, capture_started.elapsed()),
+                    result => {
+                        let frame = prepare_network_frame(result?, profile)?;
+                        break (frame, capture_started.elapsed());
+                    }
                 }
             };
         }
@@ -472,43 +847,101 @@ where
 
     let mut sent = 0_u64;
     let mut datagrams_sent = 0_u64;
+    let mut oversized_dropped = 0_u64;
+    let mut recovery_wait_dropped = 0_u64;
     let mut first_frame_logged = false;
     let mut send_total = Duration::ZERO;
     let mut send_report_started = Instant::now();
-    while let Some(frame) = packet_rx.recv().await {
+    while !stream_control.shutdown.load(Ordering::Acquire) {
+        let Some(frame) = packet_rx.recv().await else {
+            break;
+        };
         let send_started = Instant::now();
-        let fragments = packetize_video_message(frame.message.as_ref(), max_datagram_size)?;
         let keyframe = matches!(
             frame.message.as_ref(),
             WireMessage::Video { keyframe: true, .. }
         );
-        // A keyframe is required before inter frames are useful.  Repeat its
-        // fragments once so a single lost QUIC DATAGRAM does not leave the
-        // viewer waiting for another GOP.  Inter frames remain single-shot to
-        // keep bandwidth and queue pressure bounded on narrow links.
-        let fragment_repetitions = if keyframe { 2 } else { 1 };
         if !first_frame_logged {
             log(
                 LogLevel::Info,
                 "direct-computing::stream-host",
                 &format!(
-                    "first video frame sequence={} fragments={} datagram_size={} keyframe={} repetitions={}",
+                    "first video frame sequence={} bytes={} keyframe={} transport={}",
                     frame.sequence,
-                    fragments.len(),
-                    max_datagram_size,
+                    frame.encoded_bytes,
                     keyframe,
-                    fragment_repetitions
+                    if keyframe && hybrid_video {
+                        "reliable-stream"
+                    } else {
+                        "quic-datagram"
+                    }
                 ),
             );
             first_frame_logged = true;
         }
-        for fragment in fragments {
-            for _ in 0..fragment_repetitions {
+
+        if keyframe && hybrid_video {
+            stream_control
+                .recovery_pending
+                .store(true, Ordering::Release);
+            keyframe_stream
+                .as_mut()
+                .expect("hybrid media stream was opened")
+                .send(frame.message.as_ref())
+                .await?;
+            // A reliable keyframe can take seconds to cross a narrow link.
+            // Discard any inter frame captured while it was in flight; those
+            // frames are already stale when the keyframe is acknowledged.
+            let mut stale_frames = 0_u64;
+            while packet_rx.try_recv().is_ok() {
+                stale_frames = stale_frames.saturating_add(1);
+            }
+            if stale_frames > 0 {
+                log(
+                    LogLevel::Debug,
+                    "direct-computing::stream-host",
+                    &format!(
+                        "discarded {} stale encoded frames after reliable keyframe sequence={}",
+                        stale_frames, frame.sequence
+                    ),
+                );
+            }
+        } else {
+            if !keyframe && hybrid_video && stream_control.recovery_pending.load(Ordering::Acquire)
+            {
+                recovery_wait_dropped = recovery_wait_dropped.saturating_add(1);
+                continue;
+            }
+            let fragments = packetize_video_message(frame.message.as_ref(), max_datagram_size)?;
+            if !keyframe && fragments.len() > MAX_DATAGRAM_FRAGMENTS_PER_FRAME {
+                oversized_dropped = oversized_dropped.saturating_add(1);
+                if let Some((bitrate, fps)) = stream_control.request_lower_rate_keyframe() {
+                    log(
+                        LogLevel::Warn,
+                        "direct-computing::stream-host",
+                        &format!(
+                            "dropped oversized inter frame sequence={} bytes={} fragments={}; requested one reliable keyframe and reduced rate to bitrate={} fps={}",
+                            frame.sequence,
+                            frame.encoded_bytes,
+                            fragments.len(),
+                            bitrate,
+                            fps
+                        ),
+                    );
+                }
+                continue;
+            }
+            for fragment in fragments {
                 // Datagram sends are intentionally non-blocking. Quinn discards
                 // queued old datagrams when its bounded media buffer is full,
                 // preventing stale frames from delaying input/control streams.
-                connection.send_datagram(fragment.clone().into())?;
+                connection.send_datagram(fragment.into())?;
                 datagrams_sent = datagrams_sent.saturating_add(1);
+            }
+            if keyframe && !hybrid_video {
+                // Legacy peers cannot acknowledge a keyframe. Allow a later
+                // recovery request after the Datagram send has been queued.
+                stream_control.acknowledge_keyframe();
             }
         }
         let send_time = send_started.elapsed();
@@ -541,9 +974,20 @@ where
             log(
                 LogLevel::Info,
                 "direct-computing::stream-host",
-                &format!("video datagrams sent={datagrams_sent}"),
+                &format!(
+                    "video datagrams sent={} oversized_dropped={} recovery_wait_dropped={} bitrate={} fps={} rtt_ms={:.1}",
+                    datagrams_sent,
+                    oversized_dropped,
+                    recovery_wait_dropped,
+                    stream_control.target_bitrate.load(Ordering::Acquire),
+                    stream_control.target_fps.load(Ordering::Acquire),
+                    connection.rtt().as_secs_f64() * 1_000.0
+                ),
             );
             sent = 0;
+            datagrams_sent = 0;
+            oversized_dropped = 0;
+            recovery_wait_dropped = 0;
             send_total = Duration::ZERO;
             send_report_started = Instant::now();
         }
@@ -559,6 +1003,59 @@ fn video_sequence(message: &WireMessage) -> Option<u64> {
         WireMessage::Video { sequence, .. } => Some(*sequence),
         _ => None,
     }
+}
+
+fn is_effectively_zero_frame(frame: &dc_media::VideoFrame) -> bool {
+    frame.data().iter().all(|byte| *byte <= 4)
+}
+
+fn prepare_network_frame(frame: VideoFrame, profile: RateProfile) -> Result<VideoFrame> {
+    if frame.layout().pixel_format() != PixelFormat::Bgra32 {
+        return Err(DcError::Unsupported(
+            "network color-depth reduction currently requires BGRA32 input".into(),
+        ));
+    }
+    let layout = frame.layout();
+    let mut data = frame.data().to_vec();
+    for row in data.chunks_exact_mut(layout.stride()) {
+        for pixel in row[..layout.size().width() as usize * 4].chunks_exact_mut(4) {
+            // Keep per-pixel geometry and edge detail intact. Only quantize
+            // color channels; spatial filtering is intentionally disabled
+            // because it makes text and small controls hard to read.
+            pixel[0] &= profile.color_masks[0];
+            pixel[1] &= profile.color_masks[1];
+            pixel[2] &= profile.color_masks[2];
+        }
+    }
+    VideoFrame::new(frame.sequence(), frame.timestamp(), layout, data)
+}
+
+fn reduce_stream_rate(
+    bitrate: u32,
+    frames_per_second: u16,
+    min_bitrate: u32,
+    min_fps: u32,
+) -> (u32, u16) {
+    (
+        (bitrate.saturating_mul(2) / 3).max(min_bitrate),
+        (u32::from(frames_per_second) * 2 / 3).max(min_fps) as u16,
+    )
+}
+
+fn increase_stream_rate(
+    bitrate: u32,
+    frames_per_second: u16,
+    max_bitrate: u32,
+    max_fps: u32,
+) -> (u32, u16) {
+    (
+        bitrate
+            .saturating_mul(4)
+            .saturating_div(3)
+            .saturating_add(1)
+            .min(max_bitrate),
+        u32::from(frames_per_second).saturating_add(1).min(max_fps) as u16,
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -718,7 +1215,12 @@ fn create_viewer_decoder() -> Result<Box<dyn dc_media::VideoDecoder>> {
     Ok(Box::new(decoder))
 }
 
-fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) -> Result<()> {
+fn run_network_viewer(
+    address: &str,
+    password: &str,
+    fingerprint: Option<&str>,
+    profile: RateProfile,
+) -> Result<()> {
     let address = address.to_owned();
     let password = password.to_owned();
     tokio::runtime::Builder::new_multi_thread()
@@ -752,6 +1254,7 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                 Capabilities {
                     desktop: true,
                     control_input: true,
+                    hybrid_video: true,
                     ..Capabilities::default()
                 },
             )
@@ -761,14 +1264,25 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                     "desktop viewing is not permitted".into(),
                 ));
             }
+            let host_hybrid_video = session.peer_capabilities.hybrid_video;
             let _ = control.receive().await?;
             let max_datagram_size = connection.max_datagram_size();
             log(
                 LogLevel::Info,
                 "direct-computing::stream-viewer",
                 &format!(
-                    "video transport=quic-datagram max_datagram_size={:?}",
-                    max_datagram_size
+                    "media protocol={} host_hybrid_video={} video transport={} max_datagram_size={:?} profile={} bitrate={} fps={}",
+                    MEDIA_PROTOCOL_REVISION,
+                    host_hybrid_video,
+                    if host_hybrid_video {
+                        "hybrid-keyframe-stream+quic-datagram"
+                    } else {
+                        "legacy-quic-datagram"
+                    },
+                    max_datagram_size,
+                    profile.name,
+                    profile.initial_bitrate,
+                    profile.initial_fps
                 ),
             );
             if max_datagram_size.is_none() {
@@ -776,6 +1290,21 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                     "peer does not support QUIC DATAGRAM video; update the Host and reconnect"
                         .into(),
                 ));
+            }
+            // Capability negotiation already distinguishes old Hosts, so a
+            // new Host's media stream is accepted without an arbitrary
+            // latency timeout.
+            let mut keyframe_stream = if host_hybrid_video {
+                Some(connection.accept_stream().await?)
+            } else {
+                None
+            };
+            if keyframe_stream.is_none() {
+                log(
+                    LogLevel::Warn,
+                    "direct-computing::stream-viewer",
+                    "Host does not advertise hybrid media; using legacy Datagram keyframes",
+                );
             }
             let mut decoder = create_viewer_decoder()?;
             let mut sink = PreviewWindowSink::new("Direct Computing - Remote Desktop");
@@ -786,42 +1315,91 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                 &format!("present backend={}", PreviewWindowSink::render_backend()),
             );
             let mut desktop_size = None;
-            // Video is carried over an unreliable, unordered QUIC DATAGRAM
-            // lane. Incomplete or stale frames are discarded by the
-            // reassembler; control/input continue using the reliable stream.
+            // Keyframes arrive on a dedicated reliable stream. Inter frames
+            // use unreliable, unordered QUIC DATAGRAM; incomplete or stale
+            // frames are discarded without blocking control/input traffic.
+            let (keyframe_tx, mut keyframe_rx) = tokio::sync::mpsc::channel::<
+                std::result::Result<ReceivedFrame, String>,
+            >(2);
+            if let Some(mut keyframe_stream) = keyframe_stream.take() {
+                tokio::spawn(async move {
+                    loop {
+                        match keyframe_stream.receive().await {
+                        Ok(message)
+                            if matches!(
+                                &message,
+                                WireMessage::Video {
+                                    keyframe: true,
+                                    ..
+                                }
+                            ) =>
+                        {
+                            let received_at = Instant::now();
+                            if keyframe_tx
+                                .send(Ok(ReceivedFrame {
+                                    message: Arc::new(message),
+                                    received_at,
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Ok(_) => {
+                            let _ = keyframe_tx
+                                .send(Err("reliable media stream received a non-keyframe".into()))
+                                .await;
+                            break;
+                        }
+                        Err(error) => {
+                            let _ = keyframe_tx.send(Err(error.to_string())).await;
+                            break;
+                        }
+                        }
+                    }
+                });
+            }
             let (video_tx, mut video_rx) = tokio::sync::watch::channel::<
                 Option<std::result::Result<ReceivedFrame, String>>,
             >(None);
+            let datagrams_received = Arc::new(AtomicU64::new(0));
+            let receiver_datagrams = datagrams_received.clone();
             let datagram_connection = connection.clone();
             tokio::spawn(async move {
                 let mut reassembler = VideoDatagramReassembler::new();
-                let mut datagrams_received = 0_u64;
+                let mut completed_frames = 0_u64;
                 loop {
-                    let received_at = Instant::now();
                     match datagram_connection.receive_datagram().await {
                         Ok(datagram) => {
-                            datagrams_received += 1;
-                            if datagrams_received <= 3 {
+                            let received_at = Instant::now();
+                            let received_count = receiver_datagrams
+                                .fetch_add(1, Ordering::Relaxed)
+                                .saturating_add(1);
+                            if received_count <= 3 {
                                 log(
                                     LogLevel::Info,
                                     "direct-computing::stream-viewer",
                                     &format!(
                                         "received video datagram index={} bytes={}",
-                                        datagrams_received,
+                                        received_count,
                                         datagram.len()
                                     ),
                                 );
                             }
                             match reassembler.push(&datagram) {
                             Ok(Some(message)) => {
-                                log(
-                                    LogLevel::Info,
-                                    "direct-computing::stream-viewer",
-                                    &format!(
-                                        "received complete video frame after {} datagrams",
-                                        datagrams_received
-                                    ),
-                                );
+                                completed_frames = completed_frames.saturating_add(1);
+                                if completed_frames == 1 {
+                                    log(
+                                        LogLevel::Info,
+                                        "direct-computing::stream-viewer",
+                                        &format!(
+                                            "received first complete inter frame after {} datagrams",
+                                            received_count
+                                        ),
+                                    );
+                                }
                                 if video_tx
                                     .send(Some(Ok(ReceivedFrame {
                                         message: Arc::new(message),
@@ -854,8 +1432,22 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
             let mut last_sequence: Option<u64> = None;
             let mut last_keyframe_request: Option<Instant> = None;
             let mut last_frame_progress = Instant::now();
+            let mut datagrams_at_last_frame = 0_u64;
+            let mut requested_bitrate = profile.initial_bitrate;
+            let mut requested_fps = profile.initial_fps as u16;
+            let mut stable_inter_frames = 0_u32;
+            let mut stable_since = Instant::now();
+            // Explicitly publish the startup floor so a Host using the same
+            // binary cannot accidentally begin at a higher cached rate.
+            control
+                .send(&WireMessage::RateHint {
+                    bitrate: requested_bitrate,
+                    frames_per_second: requested_fps,
+                })
+                .await?;
             let mut packet_logged = false;
             let mut decoded_logged = false;
+            let mut content_frame_logged = false;
             let mut presented = 0_u64;
             let mut dropped = 0_u64;
             let mut decode_total = Duration::ZERO;
@@ -863,22 +1455,29 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
             let mut receive_to_present_total = Duration::ZERO;
             let mut report_started = Instant::now();
             while sink.is_open() {
-                let update = match tokio::time::timeout(
-                    Duration::from_millis(16),
-                    video_rx.changed(),
-                )
-                .await
-                {
-                    Ok(Ok(())) => video_rx.borrow_and_update().clone(),
-                    Ok(Err(_)) => {
-                        return Err(DcError::Platform(
-                            "video datagram receiver closed".into(),
-                        ));
+                let update = match keyframe_rx.try_recv() {
+                    Ok(update) => Some(update),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        match tokio::time::timeout(
+                            Duration::from_millis(16),
+                            video_rx.changed(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => video_rx.borrow_and_update().clone(),
+                            Ok(Err(_)) => {
+                                return Err(DcError::Platform(
+                                    "video datagram receiver closed".into(),
+                                ));
+                            }
+                            Err(_) => None,
+                        }
                     }
-                    Err(_) => None,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
                 };
                 if let Some(update) = update {
                     last_frame_progress = Instant::now();
+                    datagrams_at_last_frame = datagrams_received.load(Ordering::Relaxed);
                     let received = match update {
                         Ok(received) => received,
                         Err(error) => {
@@ -889,23 +1488,32 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                     };
                     let sequence = video_sequence(received.message.as_ref());
                     if let (Some(previous), Some(current)) = (last_sequence, sequence) {
-                        let gap = current.saturating_sub(previous.saturating_add(1));
-                        dropped += gap;
-                        if gap > 0
-                            && last_keyframe_request
-                                .is_none_or(|time| time.elapsed() >= Duration::from_secs(2))
-                        {
-                            control
-                                .send(&WireMessage::KeyframeRequest {
-                                    last_sequence: previous,
-                                })
-                                .await?;
-                            last_keyframe_request = Some(Instant::now());
+                        if current <= previous {
+                            continue;
                         }
                     }
-                    last_sequence = sequence;
                     let decode_started = Instant::now();
                     let packet = dc_desktop::message_to_packet_ref(received.message.as_ref())?;
+                    let packet_is_keyframe = packet.is_keyframe();
+                    if let Some(previous) = last_sequence {
+                        let gap = packet
+                            .sequence()
+                            .saturating_sub(previous.saturating_add(1));
+                        dropped = dropped.saturating_add(gap);
+                        if gap > 0 && !packet.is_keyframe() {
+                            if last_keyframe_request
+                                .is_none_or(|time| time.elapsed() >= Duration::from_secs(2))
+                            {
+                                control
+                                    .send(&WireMessage::KeyframeRequest {
+                                        last_sequence: previous,
+                                    })
+                                    .await?;
+                                last_keyframe_request = Some(Instant::now());
+                            }
+                            continue;
+                        }
+                    }
                     desktop_size = Some((
                         packet.source_layout().size().width(),
                         packet.source_layout().size().height(),
@@ -952,49 +1560,129 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                             continue;
                         }
                     };
-                    if !decoded_logged {
+                    if !decoded_logged || !content_frame_logged {
                         let sample = frame
                             .data()
                             .iter()
                             .take(64)
                             .fold(0_u32, |sum, byte| sum.wrapping_add(u32::from(*byte)));
                         let non_zero = frame.data().iter().filter(|byte| **byte > 4).count();
-                        log(
-                            LogLevel::Info,
-                            "direct-computing::stream-viewer",
-                            &format!(
-                                "first decoded frame sequence={} bytes={} sample_sum={} non_zero={} dimensions={}x{}",
-                                frame.sequence(),
-                                frame.data().len(),
-                                sample,
-                                non_zero,
-                                frame.layout().size().width(),
-                                frame.layout().size().height()
-                            ),
-                        );
-                        decoded_logged = true;
+                        if !decoded_logged {
+                            log(
+                                LogLevel::Info,
+                                "direct-computing::stream-viewer",
+                                &format!(
+                                    "first decoded frame sequence={} bytes={} sample_sum={} non_zero={} dimensions={}x{}",
+                                    frame.sequence(),
+                                    frame.data().len(),
+                                    sample,
+                                    non_zero,
+                                    frame.layout().size().width(),
+                                    frame.layout().size().height()
+                                ),
+                            );
+                            decoded_logged = true;
+                        }
+                        if non_zero > 0 && !content_frame_logged {
+                            log(
+                                LogLevel::Info,
+                                "direct-computing::stream-viewer",
+                                &format!(
+                                    "first non-black decoded frame sequence={} non_zero={}",
+                                    frame.sequence(), non_zero
+                                ),
+                            );
+                            content_frame_logged = true;
+                        }
                     }
+                    let presented_sequence = frame.sequence();
                     decode_total += decode_started.elapsed();
                     let present_started = Instant::now();
                     dc_media::FrameSink::present(&mut sink, frame)?;
                     present_total += present_started.elapsed();
                     receive_to_present_total += received.received_at.elapsed();
                     presented += 1;
+                    last_sequence = Some(presented_sequence);
+                    if packet_is_keyframe && host_hybrid_video {
+                        control
+                            .send(&WireMessage::KeyframeAck {
+                                sequence: presented_sequence,
+                            })
+                            .await?;
+                    }
+                    if packet_is_keyframe {
+                        stable_inter_frames = 0;
+                        stable_since = Instant::now();
+                    } else {
+                        stable_inter_frames = stable_inter_frames.saturating_add(1);
+                    }
                 }
-                if last_frame_progress.elapsed() >= Duration::from_secs(1)
+                let current_datagrams = datagrams_received.load(Ordering::Relaxed);
+                let incomplete_datagrams = current_datagrams > datagrams_at_last_frame;
+                if last_frame_progress.elapsed() >= Duration::from_secs(2)
+                    && incomplete_datagrams
                     && last_keyframe_request
                         .is_none_or(|time| time.elapsed() >= Duration::from_secs(2))
                 {
+                    if incomplete_datagrams {
+                        (requested_bitrate, requested_fps) = reduce_stream_rate(
+                            requested_bitrate,
+                            requested_fps,
+                            profile.min_bitrate,
+                            profile.min_fps,
+                        );
+                        control
+                            .send(&WireMessage::RateHint {
+                                bitrate: requested_bitrate,
+                                frames_per_second: requested_fps,
+                            })
+                            .await?;
+                    }
                     control
                         .send(&WireMessage::KeyframeRequest {
                             last_sequence: last_sequence.unwrap_or_default(),
                         })
                         .await?;
                     last_keyframe_request = Some(Instant::now());
+                    last_frame_progress = Instant::now();
+                    datagrams_at_last_frame = current_datagrams;
+                    stable_inter_frames = 0;
+                    stable_since = Instant::now();
                     log(
                         LogLevel::Debug,
                         "direct-computing::stream-viewer",
-                        "no complete video frame received for 1s; requested keyframe",
+                        &format!(
+                            "no complete video frame for 2s; requested keyframe bitrate={} fps={} incomplete_datagrams={}",
+                            requested_bitrate, requested_fps, incomplete_datagrams
+                        ),
+                    );
+                }
+                if stable_inter_frames >= RATE_UPGRADE_MIN_INTER_FRAMES
+                    && stable_since.elapsed() >= RATE_UPGRADE_INTERVAL
+                    && (requested_bitrate < profile.max_bitrate
+                        || u32::from(requested_fps) < profile.max_fps)
+                {
+                    (requested_bitrate, requested_fps) = increase_stream_rate(
+                        requested_bitrate,
+                        requested_fps,
+                        profile.max_bitrate,
+                        profile.max_fps,
+                    );
+                    control
+                        .send(&WireMessage::RateHint {
+                            bitrate: requested_bitrate,
+                            frames_per_second: requested_fps,
+                        })
+                        .await?;
+                    stable_inter_frames = 0;
+                    stable_since = Instant::now();
+                    log(
+                        LogLevel::Info,
+                        "direct-computing::stream-viewer",
+                        &format!(
+                            "stable network; increased stream rate to bitrate={} fps={}",
+                            requested_bitrate, requested_fps
+                        ),
                     );
                 }
                 sink.pump_events();
@@ -1220,5 +1908,83 @@ fn average_millis(duration: Duration, samples: u64) -> f64 {
         0.0
     } else {
         duration.as_secs_f64() * 1_000.0 / samples as f64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dc_media::FrameLayout;
+
+    #[test]
+    fn rate_reduction_reaches_but_does_not_cross_floor() {
+        assert_eq!(reduce_stream_rate(320_000, 8, 96_000, 4), (213_333, 5));
+        assert_eq!(reduce_stream_rate(160_000, 5, 64_000, 3), (106_666, 3));
+        assert_eq!(reduce_stream_rate(64_000, 3, 64_000, 3), (64_000, 3));
+        assert_eq!(increase_stream_rate(96_000, 4, 320_000, 8), (128_001, 5));
+        assert_eq!(increase_stream_rate(320_000, 8, 320_000, 8), (320_000, 8));
+    }
+
+    #[test]
+    fn stream_control_clamps_untrusted_rate_hints() {
+        let control = StreamControl::new(LOW_RATE_PROFILE);
+        control.update_rate(1, 1);
+        assert_eq!(
+            control.target_bitrate.load(Ordering::Acquire),
+            LOW_RATE_PROFILE.min_bitrate
+        );
+        assert_eq!(
+            control.target_fps.load(Ordering::Acquire),
+            LOW_RATE_PROFILE.min_fps
+        );
+        control.update_rate(u32::MAX, u16::MAX);
+        assert_eq!(
+            control.target_bitrate.load(Ordering::Acquire),
+            LOW_RATE_PROFILE.max_bitrate
+        );
+        assert_eq!(
+            control.target_fps.load(Ordering::Acquire),
+            LOW_RATE_PROFILE.max_fps
+        );
+    }
+
+    #[test]
+    fn startup_zero_frame_detection_allows_real_content() {
+        let size = FrameSize::new(2, 2).unwrap();
+        let layout = FrameLayout::packed(size, PixelFormat::Bgra32).unwrap();
+        let zero = VideoFrame::new(0, Duration::ZERO, layout, vec![0; 16]).unwrap();
+        let mut content_bytes = vec![0; 16];
+        content_bytes[4] = 5;
+        let content = VideoFrame::new(1, Duration::ZERO, layout, content_bytes).unwrap();
+        assert!(is_effectively_zero_frame(&zero));
+        assert!(!is_effectively_zero_frame(&content));
+    }
+
+    #[test]
+    fn color_depth_reduction_preserves_frame_geometry() {
+        let size = FrameSize::new(2, 1).unwrap();
+        let layout = FrameLayout::packed(size, PixelFormat::Bgra32).unwrap();
+        let frame = VideoFrame::new(
+            7,
+            Duration::ZERO,
+            layout,
+            vec![0x13, 0x27, 0x3b, 0xff, 0x45, 0x59, 0x6d, 0xff],
+        )
+        .unwrap();
+        let reduced = prepare_network_frame(frame, LOW_RATE_PROFILE).unwrap();
+        assert_eq!(reduced.layout().size(), size);
+        assert_eq!(
+            reduced.data(),
+            &[0x00, 0x20, 0x20, 0xff, 0x40, 0x40, 0x60, 0xff]
+        );
+    }
+
+    #[test]
+    fn keyframe_recovery_requests_are_coalesced_until_acknowledged() {
+        let control = StreamControl::new(LOW_RATE_PROFILE);
+        assert!(control.request_keyframe());
+        assert!(!control.request_keyframe());
+        control.acknowledge_keyframe();
+        assert!(control.request_keyframe());
     }
 }
