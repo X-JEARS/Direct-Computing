@@ -12,6 +12,10 @@ pub use windows::WindowsDesktopCapturer;
 mod media_foundation;
 #[cfg(target_os = "windows")]
 pub use media_foundation::WindowsMediaFoundationH264Encoder;
+#[cfg(target_os = "windows")]
+mod media_foundation_decoder;
+#[cfg(target_os = "windows")]
+pub use media_foundation_decoder::WindowsMediaFoundationH264Decoder;
 
 /// Sink for authenticated remote input events.
 pub trait InputInjector {

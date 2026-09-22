@@ -575,21 +575,22 @@ Wayland 放在 X11 之后实现。
 之前必须先完成以下与具体硬件后端无关的低延迟基础：
 
 - [x] 将 Host 的采集、编码移出异步运行时线程
-- [x] 使用覆盖式最新帧通道，避免采集、编码和发送队列累积延迟
-- [x] Viewer 接收端只保留最新视频包，不追赶过时帧
+- [x] 使用有界有序视频队列和背压，避免 H.264 参考帧被覆盖丢弃
 - [x] 合并同一 UI tick 内的鼠标移动事件，按键事件保持顺序
 - [x] 记录 capture/encode/send/receive/decode/present 的阶段耗时和接收至显示延迟
 - [x] 接入通用 Windows Media Foundation H.264 MFT 后端（优先硬件、软件回退）
+- [x] Windows Viewer 接入 Media Foundation H.264 解码（优先硬件、OpenH264 回退）
 - [x] macOS Viewer 接入 VideoToolbox H.264 解码并保留 OpenH264 运行时回退
 - [x] macOS Viewer 保留 VideoToolbox 原生 BGRA 输出并通过 Metal 窗口呈现，跳过 RGB24 颜色转换
 - [ ] 在 1080p/30 下完成端到端 P95 延迟基准
 
-当前软件编码器会在 Host 启动时报告 backend、hardware、zero-copy 和 low-latency 能力；
-网络 Host/Viewer 每秒报告采集、编码、发送背压、解码、显示、接收至显示耗时，以及被
-最新帧策略丢弃的序号数量。接收至显示耗时不等于跨主机端到端帧年龄，后者还需要同步的
+当前编码器和 Viewer 解码器会在启动或首个视频包到达时报告 backend、hardware、zero-copy
+和 low-latency 能力；网络 Host/Viewer 每秒报告采集、编码、发送背压、解码、显示和接收至
+显示耗时。接收至显示耗时不等于跨主机端到端帧年龄，后者还需要同步的
 捕获时钟字段和双机基准测试。
 
-macOS Viewer 优先使用系统 VideoToolbox 解码 H.264，并在解码失败时切换到 OpenH264。
+Windows Viewer 优先使用 Media Foundation H.264 Decoder MFT，并在初始化或运行失败时切换到
+OpenH264；macOS Viewer 优先使用系统 VideoToolbox，并保留同样的 OpenH264 回退路径。
 VideoToolbox 会请求原生 BGRA 输出；macOS 的 minifb 窗口使用 Metal 上传和呈现该缓冲区，
 因此不再执行逐像素 RGB24 颜色转换。CVPixelBuffer 直接交给 Metal 的完全零拷贝显示仍属于
 后续渲染优化。

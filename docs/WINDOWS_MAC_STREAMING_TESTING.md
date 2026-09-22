@@ -25,6 +25,12 @@ Record the printed certificate SHA-256 fingerprint. On macOS, connect using the 
 cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<password>'
 ```
 
+For a Windows Viewer, use the same `--connect` command. The Viewer lazily
+initializes a Windows Media Foundation H.264 decoder after the first packet,
+preferring a hardware decoder MFT and falling back to OpenH264 when no usable
+MFT is available. The log identifies the selected backend and reports whether
+`hardware=true`.
+
 At startup, confirm that the Viewer reports:
 
 ```text
@@ -58,6 +64,12 @@ cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<passwo
 - On macOS, the Viewer requests VideoToolbox BGRA output and reports the Metal presentation
   backend; `zero_copy=false` is expected because the current cross-platform frame model still
   copies the CVPixelBuffer before the Metal upload.
+- On Windows, a successful Media Foundation Viewer path reports
+  `decoder backend=windows-media-foundation-h264-decoder`; NV12 output is copied
+  into the shared BGRA frame model, so `zero_copy=false` is expected.
+- Video packets remain ordered under decode backpressure. Replacing pending
+  packets with the newest packet would discard H.264 reference frames and make
+  both hardware and software decoders fail.
 - The stream remains active for at least 15 minutes without QUIC, decode, or application errors.
 - Moving the mouse and pressing/releasing keys in the macOS Viewer produces the expected input on
   Windows. Verify only on a disposable test desktop; remote input is intentionally enabled by the

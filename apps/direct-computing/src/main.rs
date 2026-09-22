@@ -13,7 +13,9 @@ use dc_platform::VideoToolboxH264Decoder;
 #[cfg(target_os = "windows")]
 use dc_platform::{InputInjector, WindowsInputInjector};
 #[cfg(target_os = "windows")]
-use dc_platform::{WindowsDesktopCapturer, WindowsMediaFoundationH264Encoder};
+use dc_platform::{
+    WindowsDesktopCapturer, WindowsMediaFoundationH264Decoder, WindowsMediaFoundationH264Encoder,
+};
 use dc_protocol::PROTOCOL_VERSION;
 use dc_protocol::{Capabilities, WireMessage};
 use dc_session::{authenticate_client, authenticate_server};
@@ -280,10 +282,10 @@ where
     S: dc_media::FrameSource + Send + 'static,
     F: FnOnce(&dc_media::VideoFrame) -> Result<Box<dyn dc_media::VideoEncoder>> + Send + 'static,
 {
-    // Keep capture and encoding off the async runtime thread. The watch channel
-    // intentionally has no queue: if the sender is busy, a newer frame replaces
-    // the older one instead of adding latency.
-    let (packet_tx, mut packet_rx) = tokio::sync::watch::channel::<Option<Arc<EncodedFrame>>>(None);
+    // Keep capture and encoding off the async runtime thread. H.264 packets
+    // must stay ordered: dropping an inter-frame packet would invalidate the
+    // decoder reference chain. Backpressure throttles capture instead.
+    let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<Arc<EncodedFrame>>(4);
     let producer = tokio::task::spawn_blocking(move || -> Result<()> {
         use dc_media::EncodeOutcome;
         let first_capture_started = Instant::now();
@@ -323,16 +325,18 @@ where
                 let encode_time = encode_started.elapsed();
                 encode_total += encode_time;
                 encoded += 1;
-                if packet_tx.receiver_count() == 0 {
+                if packet_tx
+                    .blocking_send(Arc::new(EncodedFrame {
+                        sequence: packet.sequence(),
+                        encoded_bytes: packet.data().len() as u64,
+                        capture_time,
+                        encode_time,
+                        message: Arc::new(packet_to_message(&packet)?),
+                    }))
+                    .is_err()
+                {
                     return Ok(());
                 }
-                packet_tx.send_replace(Some(Arc::new(EncodedFrame {
-                    sequence: packet.sequence(),
-                    encoded_bytes: packet.data().len() as u64,
-                    capture_time,
-                    encode_time,
-                    message: Arc::new(packet_to_message(&packet)?),
-                })));
             }
             if report_started.elapsed() >= Duration::from_secs(1) {
                 log(
@@ -372,48 +376,45 @@ where
     let mut sent = 0_u64;
     let mut send_total = Duration::ZERO;
     let mut send_report_started = Instant::now();
-    loop {
-        if packet_rx.changed().await.is_err() {
-            return producer
-                .await
-                .map_err(|error| DcError::Platform(format!("capture task failed: {error}")))?;
+    while let Some(frame) = packet_rx.recv().await {
+        let send_started = Instant::now();
+        stream.send(frame.message.as_ref()).await?;
+        let send_time = send_started.elapsed();
+        sent += 1;
+        send_total += send_time;
+        if send_time >= Duration::from_millis(20) {
+            log(
+                LogLevel::Debug,
+                "direct-computing::stream-host",
+                &format!(
+                    "send backpressure: sequence={} bytes={} wait={:.2}ms capture={:.2}ms encode={:.2}ms",
+                    frame.sequence,
+                    frame.encoded_bytes,
+                    send_time.as_secs_f64() * 1_000.0,
+                    frame.capture_time.as_secs_f64() * 1_000.0,
+                    frame.encode_time.as_secs_f64() * 1_000.0
+                ),
+            );
         }
-        if let Some(frame) = packet_rx.borrow_and_update().clone() {
-            let send_started = Instant::now();
-            stream.send(frame.message.as_ref()).await?;
-            let send_time = send_started.elapsed();
-            sent += 1;
-            send_total += send_time;
-            if send_time >= Duration::from_millis(20) {
-                log(
-                    LogLevel::Debug,
-                    "direct-computing::stream-host",
-                    &format!(
-                        "send backpressure: sequence={} bytes={} wait={:.2}ms capture={:.2}ms encode={:.2}ms",
-                        frame.sequence,
-                        frame.encoded_bytes,
-                        send_time.as_secs_f64() * 1_000.0,
-                        frame.capture_time.as_secs_f64() * 1_000.0,
-                        frame.encode_time.as_secs_f64() * 1_000.0
-                    ),
-                );
-            }
-            if send_report_started.elapsed() >= Duration::from_secs(1) {
-                log(
-                    LogLevel::Info,
-                    "direct-computing::stream-host",
-                    &format!(
-                        "sent={} send_avg={:.2}ms",
-                        sent,
-                        average_millis(send_total, sent)
-                    ),
-                );
-                sent = 0;
-                send_total = Duration::ZERO;
-                send_report_started = Instant::now();
-            }
+        if send_report_started.elapsed() >= Duration::from_secs(1) {
+            log(
+                LogLevel::Info,
+                "direct-computing::stream-host",
+                &format!(
+                    "sent={} send_avg={:.2}ms",
+                    sent,
+                    average_millis(send_total, sent)
+                ),
+            );
+            sent = 0;
+            send_total = Duration::ZERO;
+            send_report_started = Instant::now();
         }
     }
+    producer
+        .await
+        .map_err(|error| DcError::Platform(format!("capture task failed: {error}")))??;
+    Ok(())
 }
 
 fn video_sequence(message: &WireMessage) -> Option<u64> {
@@ -460,6 +461,79 @@ impl dc_media::VideoDecoder for MacViewerDecoder {
     }
 }
 
+#[cfg(target_os = "windows")]
+struct WindowsViewerDecoder {
+    hardware: Option<WindowsMediaFoundationH264Decoder>,
+    fallback: OpenH264Decoder,
+}
+
+#[cfg(target_os = "windows")]
+impl dc_media::VideoDecoder for WindowsViewerDecoder {
+    fn codec(&self) -> dc_media::VideoCodec {
+        dc_media::VideoCodec::H264
+    }
+
+    fn capabilities(&self) -> dc_media::DecoderCapabilities {
+        match &self.hardware {
+            Some(decoder) => dc_media::VideoDecoder::capabilities(decoder),
+            None => dc_media::VideoDecoder::capabilities(&self.fallback),
+        }
+    }
+
+    fn decode(&mut self, packet: dc_media::EncodedVideoPacket) -> Result<dc_media::VideoFrame> {
+        if self.hardware.is_none() {
+            let size = packet.source_layout().size();
+            match WindowsMediaFoundationH264Decoder::new(size.width(), size.height()) {
+                Ok(decoder) => {
+                    let capabilities = dc_media::VideoDecoder::capabilities(&decoder);
+                    log(
+                        LogLevel::Info,
+                        "direct-computing::stream-viewer",
+                        &format!(
+                            "decoder backend={} hardware={} zero_copy={} low_latency={}",
+                            capabilities.backend,
+                            capabilities.hardware_accelerated,
+                            capabilities.zero_copy_output,
+                            capabilities.low_latency
+                        ),
+                    );
+                    self.hardware = Some(decoder);
+                }
+                Err(error) => log(
+                    LogLevel::Warn,
+                    "direct-computing::stream-viewer",
+                    &format!("Media Foundation decoder unavailable, using OpenH264: {error}"),
+                ),
+            }
+        }
+        if let Some(decoder) = &mut self.hardware {
+            match dc_media::VideoDecoder::decode(decoder, packet.clone()) {
+                Ok(frame) => return Ok(frame),
+                Err(error) => {
+                    log(
+                        LogLevel::Warn,
+                        "direct-computing::stream-viewer",
+                        &format!("Media Foundation decode failed, switching to OpenH264: {error}"),
+                    );
+                    self.hardware = None;
+                }
+            }
+        }
+        dc_media::VideoDecoder::decode(&mut self.fallback, packet)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_viewer_decoder() -> Result<Box<dyn dc_media::VideoDecoder>> {
+    // The stream dimensions are learned from the first packet, so the
+    // Windows MFT is initialized lazily in run_network_viewer.
+    Ok(Box::new(WindowsViewerDecoder {
+        hardware: None,
+        fallback: OpenH264Decoder::new()?,
+    }))
+}
+
+#[cfg(not(target_os = "windows"))]
 fn create_viewer_decoder() -> Result<Box<dyn dc_media::VideoDecoder>> {
     #[cfg(target_os = "macos")]
     {
@@ -560,11 +634,11 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                 &format!("present backend={}", PreviewWindowSink::render_backend()),
             );
             let mut desktop_size = None;
-            // Keep only the newest packet. An unbounded or FIFO queue turns a
-            // slow decoder into steadily increasing end-to-end latency.
-            let (video_tx, mut video_rx) = tokio::sync::watch::channel::<
-                Option<std::result::Result<ReceivedFrame, String>>,
-            >(None);
+            // H.264 packets are reference-dependent. Preserve order and let
+            // QUIC backpressure the sender instead of replacing P-frames.
+            let (video_tx, mut video_rx) = tokio::sync::mpsc::channel::<
+                std::result::Result<ReceivedFrame, String>,
+            >(4);
             tokio::spawn(async move {
                 loop {
                     let received_at = Instant::now();
@@ -577,7 +651,9 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                         })
                         .map_err(|error| error.to_string());
                     let done = result.is_err();
-                    video_tx.send_replace(Some(result));
+                    if video_tx.send(result).await.is_err() {
+                        break;
+                    }
                     if done {
                         break;
                     }
@@ -591,19 +667,21 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
             let mut receive_to_present_total = Duration::ZERO;
             let mut report_started = Instant::now();
             while sink.is_open() {
-                let video_changed = match video_rx.has_changed() {
-                    Ok(changed) => changed,
-                    Err(_) => {
+                let update = match tokio::time::timeout(
+                    Duration::from_millis(16),
+                    video_rx.recv(),
+                )
+                .await
+                {
+                    Ok(Some(update)) => Some(update),
+                    Ok(None) => {
                         return Err(DcError::Platform(
                             "video stream closed without a final status".into(),
                         ));
                     }
+                    Err(_) => None,
                 };
-                if video_changed {
-                    let update = video_rx
-                        .borrow_and_update()
-                        .clone()
-                        .ok_or_else(|| DcError::Platform("video receiver ended".into()))?;
+                if let Some(update) = update {
                     let received = match update {
                         Ok(received) => received,
                         Err(error) => {
