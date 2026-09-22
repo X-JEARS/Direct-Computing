@@ -195,6 +195,9 @@ cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<passwo
   acceptable, but this repeated oversized-inter-frame cycle remains the main
   bandwidth/latency issue to solve. The run did not show connection loss or
   decoder errors.
+- On Windows, a failed Media Foundation Viewer decoder probe is cached for the
+  lifetime of the stream; the Viewer then stays on OpenH264 instead of retrying
+  the unavailable MFT for every frame.
 - H.264 input is already 4:2:0 on both Windows Media Foundation and OpenH264 paths:
   Media Foundation receives NV12, while OpenH264 converts BGRA/RGB input into its
   internal YUV 4:2:0 representation. The 16-bit color-depth step is an additional

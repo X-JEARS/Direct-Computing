@@ -1098,6 +1098,7 @@ impl dc_media::VideoDecoder for MacViewerDecoder {
 #[cfg(target_os = "windows")]
 struct WindowsViewerDecoder {
     hardware: Option<WindowsMediaFoundationH264Decoder>,
+    hardware_attempted: bool,
     fallback: OpenH264Decoder,
 }
 
@@ -1115,7 +1116,8 @@ impl dc_media::VideoDecoder for WindowsViewerDecoder {
     }
 
     fn decode(&mut self, packet: dc_media::EncodedVideoPacket) -> Result<dc_media::VideoFrame> {
-        if self.hardware.is_none() {
+        if self.hardware.is_none() && !self.hardware_attempted {
+            self.hardware_attempted = true;
             let size = packet.source_layout().size();
             match WindowsMediaFoundationH264Decoder::new(size.width(), size.height()) {
                 Ok(decoder) => {
@@ -1163,6 +1165,7 @@ fn create_viewer_decoder() -> Result<Box<dyn dc_media::VideoDecoder>> {
     // Windows MFT is initialized lazily in run_network_viewer.
     Ok(Box::new(WindowsViewerDecoder {
         hardware: None,
+        hardware_attempted: false,
         fallback: OpenH264Decoder::new()?,
     }))
 }
