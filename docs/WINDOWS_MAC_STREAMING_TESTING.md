@@ -107,7 +107,7 @@ OpenH264. Treat fallback as a functional pass but not as a hardware-acceleration
 Viewer 启动后会先创建占位窗口。正常收到并重组首帧时，应依次看到类似日志：
 
 ```text
-media protocol=hybrid-v2 host_hybrid_video=true video transport=hybrid-keyframe-stream+quic-datagram ...
+media protocol=hybrid-v5-selective-regions host_hybrid_video=true selective_retransmit=true video transport=hybrid-keyframe-stream+h264-nal-datagram ...
 received video datagram index=1 bytes=...
 received first complete video frame after ... datagrams
 first encoded frame sequence=... keyframe=true ...
@@ -120,7 +120,7 @@ presented=1 ...
 Host 同时应记录：
 
 ```text
-media protocol=hybrid-v2 peer hybrid_video=true
+media protocol=hybrid-v5-selective-regions peer hybrid_video=true selective_retransmit=true
 ```
 
 若 Host 记录 `hybrid_video=false`，说明连接到的是旧 Viewer；Host 会自动退回
@@ -139,7 +139,7 @@ no complete video frame for 2s; requested keyframe bitrate=... fps=... incomplet
 
 ```text
 first video frame sequence=... bytes=... keyframe=true transport=reliable-stream
-video datagrams sent=... oversized_dropped=... recovery_wait_dropped=... bitrate=... fps=... rtt_ms=...
+video datagrams sent=... retransmitted=... retransmit_cache_misses=... oversized_dropped=... recovery_wait_dropped=... bitrate=... fps=... rtt_ms=...
 ```
 
 用来与 Viewer 的 `received video datagram` 数量对照。Host 在静止桌面下可能记录：
@@ -173,11 +173,12 @@ cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<passwo
   of one frame. Quinn's immediate-send API evicts older queued Datagram payloads
   under pressure, which previously caused a large frame to discard its own
   leading fragments.
-- In the legacy DCVD whole-frame compatibility path, a single lost Datagram
-  fragment invalidates an ordinary frame. The Host limits those ordinary frames
-  to 96 fragments; larger frames are dropped and converted into a reliable
-  keyframe recovery instead of flooding a narrow link. Peers that negotiate the
-  NAL Datagram mode packetize and reassemble each NAL independently instead.
+- In the negotiated DCVD selective-retransmission path, a missing Datagram fragment is requested
+  after a bounded reordering delay and resent from the Host's byte-for-byte fragment cache. The
+  cache is limited to eight updates, 8 MiB, and 1.5 seconds; at most two NACK rounds are sent.
+  A cache miss or a region sequence gap falls back to a reliable keyframe rather than applying a
+  patch to an unknown framebuffer base. Older peers retain the all-or-nothing compatibility path.
+  Peers that negotiate NAL Datagram mode continue to packetize H.264 NAL units independently.
 - The default balanced target preserves the captured resolution and uses true 16-bit
   RGB565-style color quantization before H.264 encoding. Pointer coordinates therefore
   remain in the original desktop coordinate system. When Datagram fragments

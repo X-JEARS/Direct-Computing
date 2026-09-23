@@ -1,7 +1,7 @@
 use dc_common::{DcError, Result};
 use dc_media::split_h264_nal_units;
-use dc_protocol::{WireMessage, MAX_MESSAGE_SIZE};
-use std::collections::BTreeMap;
+use dc_protocol::{WireMessage, MAX_MEDIA_NACK_FRAGMENTS, MAX_MESSAGE_SIZE};
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 const MAGIC: [u8; 4] = *b"DCVD";
@@ -9,6 +9,8 @@ const VERSION: u8 = 1;
 const HEADER_LEN: usize = 4 + 1 + 8 + 2 + 2 + 4;
 const MAX_IN_FLIGHT: usize = 8;
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(500);
+const MAX_NACK_ROUNDS: u8 = 2;
+const COMPLETED_SEQUENCE_WINDOW: usize = 64;
 const NAL_MAGIC: [u8; 4] = *b"DCVN";
 const NAL_VERSION: u8 = 1;
 const NAL_HEADER_LEN: usize = 48;
@@ -274,6 +276,14 @@ struct PartialFrame {
     fragments: Vec<Option<Vec<u8>>>,
     received: usize,
     last_fragment: Instant,
+    last_nack: Option<Instant>,
+    nack_rounds: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VideoDatagramNack {
+    pub sequence: u64,
+    pub missing_fragments: Vec<u16>,
 }
 
 /// Counters used to observe whether the unreliable video lane is dropping
@@ -291,6 +301,7 @@ pub struct VideoDatagramStats {
 pub struct VideoDatagramReassembler {
     frames: BTreeMap<u64, PartialFrame>,
     latest_completed: Option<u64>,
+    completed_sequences: BTreeSet<u64>,
     stats: VideoDatagramStats,
 }
 
@@ -305,12 +316,56 @@ impl VideoDatagramReassembler {
         Self {
             frames: BTreeMap::new(),
             latest_completed: None,
+            completed_sequences: BTreeSet::new(),
             stats: VideoDatagramStats::default(),
         }
     }
 
     pub fn stats(&self) -> VideoDatagramStats {
         self.stats
+    }
+
+    /// Return bounded selective-retransmission requests after fragment
+    /// delivery has stalled long enough to distinguish loss from reordering.
+    pub fn take_nacks(
+        &mut self,
+        reorder_wait: Duration,
+        retry_wait: Duration,
+    ) -> Vec<VideoDatagramNack> {
+        self.expire();
+        let now = Instant::now();
+        self.frames
+            .iter_mut()
+            .filter_map(|(sequence, frame)| {
+                if frame.nack_rounds >= MAX_NACK_ROUNDS
+                    || now.duration_since(frame.last_fragment) < reorder_wait
+                    || frame
+                        .last_nack
+                        .is_some_and(|last| now.duration_since(last) < retry_wait)
+                {
+                    return None;
+                }
+                let missing_fragments = frame
+                    .fragments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, fragment)| fragment.is_none())
+                    .map(|(index, _)| {
+                        u16::try_from(index).expect("fragment index originated as u16")
+                    })
+                    .take(MAX_MEDIA_NACK_FRAGMENTS)
+                    .collect::<Vec<_>>();
+                if missing_fragments.is_empty() {
+                    return None;
+                }
+                frame.last_nack = Some(now);
+                frame.nack_rounds = frame.nack_rounds.saturating_add(1);
+                Some(VideoDatagramNack {
+                    sequence: *sequence,
+                    missing_fragments,
+                })
+            })
+            .collect()
     }
 
     pub fn push(&mut self, datagram: &[u8]) -> Result<Option<WireMessage>> {
@@ -323,9 +378,10 @@ impl VideoDatagramReassembler {
             }
         };
         let (sequence, index, count, total_len, payload) = parsed;
-        if self
-            .latest_completed
-            .is_some_and(|latest| sequence <= latest)
+        if self.completed_sequences.contains(&sequence)
+            || self.latest_completed.is_some_and(|latest| {
+                sequence.saturating_add(COMPLETED_SEQUENCE_WINDOW as u64) < latest
+            })
         {
             return Ok(None);
         }
@@ -346,6 +402,8 @@ impl VideoDatagramReassembler {
             fragments: vec![None; count as usize],
             received: 0,
             last_fragment: Instant::now(),
+            last_nack: None,
+            nack_rounds: 0,
         });
         if frame.total_len != total_len || frame.fragments.len() != count as usize {
             self.frames.remove(&sequence);
@@ -378,7 +436,16 @@ impl VideoDatagramReassembler {
             self.stats.malformed_fragments = self.stats.malformed_fragments.saturating_add(1);
             return Err(DcError::Codec("video datagram sequence mismatch".into()));
         }
-        self.latest_completed = Some(sequence);
+        self.latest_completed = Some(
+            self.latest_completed
+                .map_or(sequence, |latest| latest.max(sequence)),
+        );
+        self.completed_sequences.insert(sequence);
+        while self.completed_sequences.len() > COMPLETED_SEQUENCE_WINDOW {
+            if let Some(oldest) = self.completed_sequences.first().copied() {
+                self.completed_sequences.remove(&oldest);
+            }
+        }
         self.stats.completed_frames = self.stats.completed_frames.saturating_add(1);
         Ok(Some(message))
     }
@@ -610,6 +677,41 @@ mod tests {
         let mut reassembler = VideoDatagramReassembler::new();
         assert!(reassembler.push(&fragments[0]).unwrap().is_none());
         assert_eq!(reassembler.stats().completed_frames, 0);
+    }
+
+    #[test]
+    fn incomplete_frame_requests_only_missing_fragments() {
+        let expected = message(2_000);
+        let fragments = packetize_video_message(&expected, 500).unwrap();
+        let mut reassembler = VideoDatagramReassembler::new();
+        assert!(reassembler.push(&fragments[0]).unwrap().is_none());
+
+        let first = reassembler.take_nacks(Duration::ZERO, Duration::ZERO);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].sequence, 7);
+        assert_eq!(
+            first[0].missing_fragments,
+            (1..fragments.len() as u16).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            reassembler.take_nacks(Duration::ZERO, Duration::ZERO),
+            first
+        );
+        assert!(reassembler
+            .take_nacks(Duration::ZERO, Duration::ZERO)
+            .is_empty());
+
+        let mut completed = None;
+        for index in &first[0].missing_fragments {
+            completed = reassembler
+                .push(&fragments[usize::from(*index)])
+                .unwrap()
+                .or(completed);
+        }
+        assert_eq!(completed, Some(expected));
+        assert!(reassembler
+            .take_nacks(Duration::ZERO, Duration::ZERO)
+            .is_empty());
     }
 
     #[test]

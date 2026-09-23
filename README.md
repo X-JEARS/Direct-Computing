@@ -57,8 +57,12 @@ control session closes unexpectedly.
 On Windows, negotiated desktop optimization reads DXGI dirty/move rectangles, sends small changes
 as bounded PackBits-compressed BGRA region updates, and transports the DXGI pointer separately for
 Viewer-side composition. Cursor-only frames bypass H.264, and an unchanged desktop is reduced to a
-five-second full-frame refresh interval. Larger or incompressible changes automatically fall back
-to the normal H.264 path; sequence gaps request a reliable recovery keyframe.
+five-second full-frame refresh interval. Peers negotiate selective retransmission for fragmented
+`DCVD` updates: the Viewer waits for reordering, requests only missing fragment indices, and the
+Host resends the cached final Datagram bytes. The cache is bounded to eight updates, 8 MiB, and
+1.5 seconds. A cache miss or a framebuffer sequence gap requests a reliable recovery keyframe
+instead of applying a patch to an unknown base. Larger or incompressible changes automatically
+fall back to the normal H.264 path.
 
 Windows Host encoder preference is hardware Media Foundation H.264, then software Media
 Foundation H.264. OpenH264 is retained only as a compatibility fallback when Media Foundation

@@ -1,6 +1,6 @@
 //! Versioned protocol primitives shared by hosts, viewers, and CLI clients.
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 2, minor: 0 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 2, minor: 1 };
 
 /// Maximum encoded protocol message accepted from a peer.  Keeping this limit at the
 /// protocol boundary prevents a malformed length field from turning into an allocation
@@ -43,9 +43,12 @@ pub struct Capabilities {
     pub desktop_optimizations: bool,
     /// Supports H.264 NAL/slice-oriented QUIC Datagram packetization.
     pub h264_nal_datagrams: bool,
+    /// Supports selective retransmission of missing legacy desktop-media fragments.
+    pub desktop_selective_retransmit: bool,
 }
 
 pub const MAX_DESKTOP_REGIONS: usize = 256;
+pub const MAX_MEDIA_NACK_FRAGMENTS: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DesktopRect {
@@ -194,6 +197,11 @@ pub enum WireMessage {
         x: i32,
         y: i32,
         shape: Option<CursorShape>,
+    },
+    /// Requests exact missing DCVD fragments while the update is still useful.
+    MediaNack {
+        sequence: u64,
+        missing_fragments: Vec<u16>,
     },
     FileOffer {
         transfer_id: [u8; 16],
@@ -355,6 +363,24 @@ impl WireMessage {
                     put_u32(&mut output, shape.hotspot_y);
                     put_u32(&mut output, shape.pitch);
                     put_bytes(&mut output, &shape.data)?;
+                }
+            }
+            Self::MediaNack {
+                sequence,
+                missing_fragments,
+            } => {
+                if missing_fragments.is_empty()
+                    || missing_fragments.len() > MAX_MEDIA_NACK_FRAGMENTS
+                {
+                    return Err(dc_common::DcError::InvalidInput(
+                        "media NACK has an invalid fragment count".into(),
+                    ));
+                }
+                output.push(18);
+                put_u64(&mut output, *sequence);
+                put_u16(&mut output, missing_fragments.len() as u16);
+                for fragment in missing_fragments {
+                    put_u16(&mut output, *fragment);
                 }
             }
             Self::FileOffer {
@@ -525,6 +551,23 @@ impl WireMessage {
                     shape,
                 }
             }
+            18 => {
+                let sequence = reader.u64()?;
+                let count = usize::from(reader.u16()?);
+                if count == 0 || count > MAX_MEDIA_NACK_FRAGMENTS {
+                    return Err(dc_common::DcError::Codec(
+                        "media NACK has an invalid fragment count".into(),
+                    ));
+                }
+                let mut missing_fragments = Vec::with_capacity(count);
+                for _ in 0..count {
+                    missing_fragments.push(reader.u16()?);
+                }
+                Self::MediaNack {
+                    sequence,
+                    missing_fragments,
+                }
+            }
             10 => Self::FileOffer {
                 transfer_id: reader.array_16()?,
                 name: reader.string()?,
@@ -580,7 +623,8 @@ fn put_capabilities(out: &mut Vec<u8>, value: Capabilities) {
         | (u16::from(value.control_input) << 6)
         | (u16::from(value.hybrid_video) << 7)
         | (u16::from(value.desktop_optimizations) << 8)
-        | (u16::from(value.h264_nal_datagrams) << 9);
+        | (u16::from(value.h264_nal_datagrams) << 9)
+        | (u16::from(value.desktop_selective_retransmit) << 10);
     put_u16(out, flags);
 }
 fn put_bytes(out: &mut Vec<u8>, value: &[u8]) -> dc_common::Result<()> {
@@ -653,6 +697,7 @@ impl<'a> Reader<'a> {
             hybrid_video: flags & 128 != 0,
             desktop_optimizations: flags & 256 != 0,
             h264_nal_datagrams: flags & 512 != 0,
+            desktop_selective_retransmit: flags & 1024 != 0,
         })
     }
 }
@@ -758,6 +803,7 @@ mod tests {
                 hybrid_video: true,
                 desktop_optimizations: true,
                 h264_nal_datagrams: true,
+                desktop_selective_retransmit: true,
                 ..Capabilities::default()
             },
         };
@@ -807,6 +853,21 @@ mod tests {
             WireMessage::decode(&cursor.encode().unwrap()).unwrap(),
             cursor
         );
+    }
+
+    #[test]
+    fn media_nack_round_trip_and_bounds() {
+        let nack = WireMessage::MediaNack {
+            sequence: 77,
+            missing_fragments: vec![1, 4, 9],
+        };
+        assert_eq!(WireMessage::decode(&nack.encode().unwrap()).unwrap(), nack);
+        assert!(WireMessage::MediaNack {
+            sequence: 77,
+            missing_fragments: Vec::new(),
+        }
+        .encode()
+        .is_err());
     }
 
     #[test]

@@ -297,5 +297,6 @@ pub use video_datagram::{
     classify_video_datagram, packetize_h264_nal_message, packetize_video_message,
 };
 pub use video_datagram::{
-    H264NalDatagramReassembler, VideoDatagramKind, VideoDatagramReassembler, VideoDatagramStats,
+    H264NalDatagramReassembler, VideoDatagramKind, VideoDatagramNack, VideoDatagramReassembler,
+    VideoDatagramStats,
 };

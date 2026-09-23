@@ -2,8 +2,8 @@ use dc_auth::{PasswordVerifier, Permissions};
 use dc_common::{init_logging, log, DcError, LogLevel, Result};
 use dc_desktop::validate_input;
 use dc_desktop::{
-    classify_video_datagram, decode_region_payload, encode_region_update, packet_to_message,
-    packetize_h264_nal_message, packetize_video_message, DirtyRegionDetector,
+    changed_area, classify_video_datagram, decode_region_payload, encode_region_update,
+    packet_to_message, packetize_h264_nal_message, packetize_video_message, DirtyRegionDetector,
     H264NalDatagramReassembler, VideoDatagramKind, VideoDatagramReassembler,
 };
 #[cfg(target_os = "windows")]
@@ -27,9 +27,10 @@ use dc_protocol::{Capabilities, WireMessage};
 use dc_session::{authenticate_client, authenticate_server};
 use dc_transport::{format_fingerprint, parse_fingerprint, QuicClient, QuicConnection, QuicServer};
 use dc_ui::{PreviewWindowSink, DIRTY_REGION_DEBUG_HOLD};
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // The encoder's bitrate is an average target; keyframes can still be larger.
@@ -83,9 +84,12 @@ const RATE_UPGRADE_MIN_INTER_FRAMES: u32 = 8;
 const MAX_DATAGRAM_FRAGMENTS_PER_FRAME: usize = 96;
 const STARTUP_ZERO_FRAME_GRACE: Duration = Duration::from_secs(2);
 const NETWORK_CHROMA_SUBSAMPLING: &str = "4:2:0";
-const MEDIA_PROTOCOL_REVISION: &str = "hybrid-v4-h264-nal-regions";
+const MEDIA_PROTOCOL_REVISION: &str = "hybrid-v5-selective-regions";
 const FULL_FRAME_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const REGION_UPDATE_MAX_BYTES: usize = 256 * 1024;
+const RETRANSMIT_CACHE_LIFETIME: Duration = Duration::from_millis(1_500);
+const RETRANSMIT_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const RETRANSMIT_CACHE_MAX_UPDATES: usize = 8;
 
 struct StreamControl {
     profile: RateProfile,
@@ -94,6 +98,8 @@ struct StreamControl {
     shutdown: AtomicBool,
     target_bitrate: AtomicU32,
     target_fps: AtomicU32,
+    retransmitted_fragments: AtomicU64,
+    retransmit_cache_misses: AtomicU64,
 }
 
 impl StreamControl {
@@ -105,6 +111,8 @@ impl StreamControl {
             shutdown: AtomicBool::new(false),
             target_bitrate: AtomicU32::new(profile.initial_bitrate),
             target_fps: AtomicU32::new(profile.initial_fps),
+            retransmitted_fragments: AtomicU64::new(0),
+            retransmit_cache_misses: AtomicU64::new(0),
         }
     }
 
@@ -193,11 +201,147 @@ struct ReceivedFrame {
     received_at: Instant,
 }
 
+#[derive(Debug)]
+struct RetransmitRequest {
+    sequence: u64,
+    missing_fragments: Vec<u16>,
+}
+
+struct CachedDatagramUpdate {
+    sequence: u64,
+    cached_at: Instant,
+    bytes: usize,
+    fragments: Vec<Vec<u8>>,
+    retransmit_rounds: u8,
+}
+
+#[derive(Default)]
+struct MediaRetransmitCache {
+    updates: VecDeque<CachedDatagramUpdate>,
+    bytes: usize,
+}
+
+impl MediaRetransmitCache {
+    fn insert(&mut self, sequence: u64, fragments: &[Vec<u8>]) {
+        self.expire();
+        let bytes = fragments.iter().map(Vec::len).sum();
+        self.updates.push_back(CachedDatagramUpdate {
+            sequence,
+            cached_at: Instant::now(),
+            bytes,
+            fragments: fragments.to_vec(),
+            retransmit_rounds: 0,
+        });
+        self.bytes = self.bytes.saturating_add(bytes);
+        while self.updates.len() > RETRANSMIT_CACHE_MAX_UPDATES
+            || self.bytes > RETRANSMIT_CACHE_MAX_BYTES
+        {
+            self.remove_oldest();
+        }
+    }
+
+    fn fragments_for(&mut self, request: &RetransmitRequest) -> Option<Vec<Vec<u8>>> {
+        self.expire();
+        let update = self
+            .updates
+            .iter_mut()
+            .find(|update| update.sequence == request.sequence)?;
+        if update.retransmit_rounds >= 2 {
+            return None;
+        }
+        let mut indices = request.missing_fragments.clone();
+        indices.sort_unstable();
+        indices.dedup();
+        let fragments = indices
+            .into_iter()
+            .filter_map(|index| update.fragments.get(usize::from(index)).cloned())
+            .collect::<Vec<_>>();
+        if fragments.is_empty() {
+            None
+        } else {
+            update.retransmit_rounds = update.retransmit_rounds.saturating_add(1);
+            Some(fragments)
+        }
+    }
+
+    fn expire(&mut self) {
+        while self
+            .updates
+            .front()
+            .is_some_and(|update| update.cached_at.elapsed() >= RETRANSMIT_CACHE_LIFETIME)
+        {
+            self.remove_oldest();
+        }
+    }
+
+    fn remove_oldest(&mut self) {
+        if let Some(update) = self.updates.pop_front() {
+            self.bytes = self.bytes.saturating_sub(update.bytes);
+        }
+    }
+}
+
+fn dispatch_selective_retransmit(
+    sequence: u64,
+    missing_fragments: Vec<u16>,
+    cache: &Arc<Mutex<MediaRetransmitCache>>,
+    connection: &QuicConnection,
+    stream_control: &Arc<StreamControl>,
+) -> Result<()> {
+    let request = RetransmitRequest {
+        sequence,
+        missing_fragments,
+    };
+    let fragments = cache
+        .lock()
+        .map_err(|_| DcError::Platform("media retransmit cache lock poisoned".into()))?
+        .fragments_for(&request);
+    let Some(fragments) = fragments else {
+        stream_control
+            .retransmit_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+        if stream_control.request_keyframe() {
+            log(
+                LogLevel::Debug,
+                "direct-computing::stream-host",
+                &format!("retransmit cache miss sequence={sequence}; requested reliable refresh"),
+            );
+        }
+        return Ok(());
+    };
+    let connection = connection.clone();
+    let stream_control = stream_control.clone();
+    tokio::spawn(async move {
+        let mut sent = 0_u64;
+        for fragment in fragments {
+            if let Err(error) = connection.send_datagram_wait(fragment.into()).await {
+                log(
+                    LogLevel::Warn,
+                    "direct-computing::stream-host",
+                    &format!("selective retransmit failed sequence={sequence}: {error}"),
+                );
+                return;
+            }
+            sent = sent.saturating_add(1);
+        }
+        stream_control
+            .retransmitted_fragments
+            .fetch_add(sent, Ordering::Relaxed);
+        log(
+            LogLevel::Debug,
+            "direct-computing::stream-host",
+            &format!("selectively retransmitted sequence={sequence} fragments={sent}"),
+        );
+    });
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct MediaFeatures {
     hybrid_video: bool,
     desktop_optimizations: bool,
     h264_nal_datagrams: bool,
+    desktop_selective_retransmit: bool,
 }
 
 fn main() {
@@ -385,6 +529,7 @@ fn run_network_host(
                     hybrid_video: true,
                     desktop_optimizations: true,
                     h264_nal_datagrams: true,
+                    desktop_selective_retransmit: true,
                     ..Capabilities::default()
                 },
             )
@@ -394,19 +539,31 @@ fn run_network_host(
                 hybrid_video && session.peer_capabilities.desktop_optimizations;
             let h264_nal_datagrams =
                 hybrid_video && session.peer_capabilities.h264_nal_datagrams;
+            let desktop_selective_retransmit = desktop_optimizations
+                && session.peer_capabilities.desktop_selective_retransmit;
             log(
                 LogLevel::Info,
                 "direct-computing::host",
                 &format!(
-                    "media protocol={} peer hybrid_video={} (client build must support reliable keyframes)",
-                    MEDIA_PROTOCOL_REVISION, hybrid_video
+                    "media protocol={} peer hybrid_video={} selective_retransmit={} (client build must support reliable keyframes)",
+                    MEDIA_PROTOCOL_REVISION, hybrid_video, desktop_selective_retransmit
                 ),
             );
             control.send(&WireMessage::OpenDesktop).await?;
             let stream_control = Arc::new(StreamControl::new(profile));
             let input_stream_control = stream_control.clone();
+            let retransmit_cache = Arc::new(Mutex::new(MediaRetransmitCache::default()));
+            let input_retransmit_cache = retransmit_cache.clone();
+            let input_datagram_connection = connection.clone();
             tokio::spawn(async move {
-                let result = receive_host_input(&mut control, input_stream_control.clone()).await;
+                let result = receive_host_input(
+                    &mut control,
+                    input_stream_control.clone(),
+                    desktop_selective_retransmit,
+                    input_retransmit_cache,
+                    input_datagram_connection,
+                )
+                .await;
                 input_stream_control
                     .shutdown
                     .store(true, Ordering::Release);
@@ -426,9 +583,13 @@ fn run_network_host(
             let result = send_desktop_frames(
                 &connection,
                 stream_control,
-                hybrid_video,
-                desktop_optimizations,
-                h264_nal_datagrams,
+                MediaFeatures {
+                    hybrid_video,
+                    desktop_optimizations,
+                    h264_nal_datagrams,
+                    desktop_selective_retransmit,
+                },
+                retransmit_cache,
                 profile,
                 use_x264,
             )
@@ -449,6 +610,9 @@ fn run_network_host(
 async fn receive_host_input(
     stream: &mut dc_transport::FramedStream,
     stream_control: Arc<StreamControl>,
+    desktop_selective_retransmit: bool,
+    retransmit_cache: Arc<Mutex<MediaRetransmitCache>>,
+    datagram_connection: QuicConnection,
 ) -> Result<()> {
     let mut injector = WindowsInputInjector::new();
     loop {
@@ -466,6 +630,18 @@ async fn receive_host_input(
                     "direct-computing::stream-host",
                     &format!("viewer acknowledged keyframe sequence={sequence}; resuming capture"),
                 );
+            }
+            WireMessage::MediaNack {
+                sequence,
+                missing_fragments,
+            } if desktop_selective_retransmit => {
+                dispatch_selective_retransmit(
+                    sequence,
+                    missing_fragments,
+                    &retransmit_cache,
+                    &datagram_connection,
+                    &stream_control,
+                )?;
             }
             WireMessage::RateHint {
                 bitrate,
@@ -486,6 +662,9 @@ async fn receive_host_input(
 async fn receive_host_input(
     stream: &mut dc_transport::FramedStream,
     stream_control: Arc<StreamControl>,
+    desktop_selective_retransmit: bool,
+    retransmit_cache: Arc<Mutex<MediaRetransmitCache>>,
+    datagram_connection: QuicConnection,
 ) -> Result<()> {
     loop {
         match stream.receive().await? {
@@ -499,6 +678,18 @@ async fn receive_host_input(
             }
             WireMessage::KeyframeAck { .. } => {
                 stream_control.acknowledge_keyframe();
+            }
+            WireMessage::MediaNack {
+                sequence,
+                missing_fragments,
+            } if desktop_selective_retransmit => {
+                dispatch_selective_retransmit(
+                    sequence,
+                    missing_fragments,
+                    &retransmit_cache,
+                    &datagram_connection,
+                    &stream_control,
+                )?;
             }
             WireMessage::RateHint {
                 bitrate,
@@ -519,9 +710,8 @@ async fn receive_host_input(
 async fn send_desktop_frames(
     connection: &QuicConnection,
     stream_control: Arc<StreamControl>,
-    hybrid_video: bool,
-    desktop_optimizations: bool,
-    h264_nal_datagrams: bool,
+    features: MediaFeatures,
+    retransmit_cache: Arc<Mutex<MediaRetransmitCache>>,
     profile: RateProfile,
     use_x264: bool,
 ) -> Result<()> {
@@ -530,11 +720,8 @@ async fn send_desktop_frames(
         connection,
         stream_control,
         source,
-        MediaFeatures {
-            hybrid_video,
-            desktop_optimizations,
-            h264_nal_datagrams,
-        },
+        features,
+        retransmit_cache,
         profile,
         move |frame, bitrate, fps, max_slice_len| {
             let size = frame.layout().size();
@@ -619,9 +806,8 @@ async fn send_desktop_frames(
 async fn send_desktop_frames(
     connection: &QuicConnection,
     stream_control: Arc<StreamControl>,
-    hybrid_video: bool,
-    desktop_optimizations: bool,
-    h264_nal_datagrams: bool,
+    features: MediaFeatures,
+    retransmit_cache: Arc<Mutex<MediaRetransmitCache>>,
     profile: RateProfile,
     use_x264: bool,
 ) -> Result<()> {
@@ -630,11 +816,8 @@ async fn send_desktop_frames(
         connection,
         stream_control,
         SyntheticFrameSource::new(size, 30)?,
-        MediaFeatures {
-            hybrid_video,
-            desktop_optimizations,
-            h264_nal_datagrams,
-        },
+        features,
+        retransmit_cache,
         profile,
         move |frame, bitrate, fps, max_slice_len| {
             if use_x264 {
@@ -673,6 +856,7 @@ async fn send_frames_from<S, F>(
     stream_control: Arc<StreamControl>,
     mut source: S,
     features: MediaFeatures,
+    retransmit_cache: Arc<Mutex<MediaRetransmitCache>>,
     profile: RateProfile,
     create_encoder: F,
 ) -> Result<()>
@@ -686,6 +870,7 @@ where
         hybrid_video,
         desktop_optimizations,
         h264_nal_datagrams,
+        desktop_selective_retransmit,
     } = features;
     let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
         DcError::Unsupported("peer did not negotiate QUIC DATAGRAM support".into())
@@ -793,6 +978,8 @@ where
         let mut region_rectangles = 0_u64;
         let mut region_bytes = 0_u64;
         let mut oversized_region_updates = 0_u64;
+        let mut dirty_area_pixels = 0_u64;
+        let mut h264_bytes = 0_u64;
         let mut cursor_updates = 0_u64;
         let mut unchanged_skipped = 0_u64;
         let mut media_sequence = 0_u64;
@@ -828,6 +1015,7 @@ where
             let recovery_frame = frame.clone();
             last_sequence = frame.sequence();
             let dirty_regions = dirty_detector.detect(&frame)?;
+            dirty_area_pixels = dirty_area_pixels.saturating_add(changed_area(&dirty_regions));
             if desktop_optimizations {
                 if let Some(cursor) = frame.metadata().cursor.as_ref() {
                     if last_cursor.as_ref() != Some(cursor) {
@@ -931,6 +1119,7 @@ where
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         queue_dropped = queue_dropped.saturating_add(1);
+                        producer_control.request_keyframe();
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                 }
@@ -947,6 +1136,7 @@ where
                     let encode_time = encode_started.elapsed();
                     encode_total += encode_time;
                     encoded += 1;
+                    h264_bytes = h264_bytes.saturating_add(packet.data().len() as u64);
                     // The source sequence advances for every capture attempt, but
                     // OpenH264/MFT may intentionally skip a frame.  Renumber only
                     // packets that really leave the encoder; otherwise the viewer
@@ -991,10 +1181,12 @@ where
                         match packet_tx.try_send(encoded_frame) {
                             Ok(()) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                // Ordinary frames remain latest-frame oriented;
-                                // dropping them is preferable to queueing stale
-                                // desktop state behind a slow network.
+                                // The encoder may reference this packet and a
+                                // region update advances the framebuffer base.
+                                // Once either is dropped before transport, the
+                                // next update cannot safely inherit its state.
                                 queue_dropped = queue_dropped.saturating_add(1);
+                                producer_control.request_keyframe();
                             }
                             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                 return Ok(());
@@ -1009,13 +1201,15 @@ where
                     LogLevel::Info,
                     "direct-computing::stream-host",
                     &format!(
-                        "capture={} encoded={} regions={} region_rects={} region_bytes={} region_oversized={} cursors={} unchanged_skipped={} queue_dropped={} capture_avg={:.2}ms encode_avg={:.2}ms",
+                        "capture={} encoded={} dirty_pixels={} regions={} region_rects={} region_bytes={} region_oversized={} h264_bytes={} cursors={} unchanged_skipped={} queue_dropped={} capture_avg={:.2}ms encode_avg={:.2}ms",
                         captured,
                         encoded,
+                        dirty_area_pixels,
                         region_updates,
                         region_rectangles,
                         region_bytes,
                         oversized_region_updates,
+                        h264_bytes,
                         cursor_updates,
                         unchanged_skipped,
                         queue_dropped,
@@ -1029,6 +1223,8 @@ where
                 region_rectangles = 0;
                 region_bytes = 0;
                 oversized_region_updates = 0;
+                dirty_area_pixels = 0;
+                h264_bytes = 0;
                 cursor_updates = 0;
                 unchanged_skipped = 0;
                 queue_dropped = 0;
@@ -1226,6 +1422,16 @@ where
                 }
                 continue;
             }
+            let cacheable_legacy_datagrams =
+                matches!(frame.message.as_ref(), WireMessage::DesktopUpdate { .. })
+                    || (!h264_nal_datagrams
+                        && matches!(frame.message.as_ref(), WireMessage::Video { .. }));
+            if desktop_selective_retransmit && cacheable_legacy_datagrams {
+                retransmit_cache
+                    .lock()
+                    .map_err(|_| DcError::Platform("media retransmit cache lock poisoned".into()))?
+                    .insert(frame.sequence, &fragments);
+            }
             for fragment in fragments {
                 // `send_datagram` evicts older queued Datagram payloads when
                 // Quinn's send buffer fills. A large frame would therefore
@@ -1273,8 +1479,14 @@ where
                 LogLevel::Info,
                 "direct-computing::stream-host",
                 &format!(
-                    "video datagrams sent={} oversized_dropped={} recovery_wait_dropped={} bitrate={} fps={} rtt_ms={:.1}",
+                    "video datagrams sent={} retransmitted={} retransmit_cache_misses={} oversized_dropped={} recovery_wait_dropped={} bitrate={} fps={} rtt_ms={:.1}",
                     datagrams_sent,
+                    stream_control
+                        .retransmitted_fragments
+                        .swap(0, Ordering::Relaxed),
+                    stream_control
+                        .retransmit_cache_misses
+                        .swap(0, Ordering::Relaxed),
                     oversized_dropped,
                     recovery_wait_dropped,
                     stream_control.target_bitrate.load(Ordering::Acquire),
@@ -1601,6 +1813,7 @@ fn run_network_viewer(
                     hybrid_video: true,
                     desktop_optimizations: true,
                     h264_nal_datagrams: true,
+                    desktop_selective_retransmit: true,
                     ..Capabilities::default()
                 },
             )
@@ -1615,15 +1828,18 @@ fn run_network_viewer(
                 host_hybrid_video && session.peer_capabilities.desktop_optimizations;
             let host_h264_nal_datagrams =
                 host_hybrid_video && session.peer_capabilities.h264_nal_datagrams;
+            let host_desktop_selective_retransmit = host_desktop_optimizations
+                && session.peer_capabilities.desktop_selective_retransmit;
             let _ = control.receive().await?;
             let max_datagram_size = connection.max_datagram_size();
             log(
                 LogLevel::Info,
                 "direct-computing::stream-viewer",
                 &format!(
-                    "media protocol={} host_hybrid_video={} video transport={} max_datagram_size={:?} profile={} bitrate={} fps={}",
+                    "media protocol={} host_hybrid_video={} selective_retransmit={} video transport={} max_datagram_size={:?} profile={} bitrate={} fps={}",
                     MEDIA_PROTOCOL_REVISION,
                     host_hybrid_video,
+                    host_desktop_selective_retransmit,
                     if host_h264_nal_datagrams {
                         "hybrid-keyframe-stream+h264-nal-datagram"
                     } else if host_hybrid_video {
@@ -1724,6 +1940,7 @@ fn run_network_viewer(
             let (video_tx, mut video_rx) = tokio::sync::mpsc::channel::<
                 std::result::Result<ReceivedFrame, String>,
             >(4);
+            let (nack_tx, mut nack_rx) = tokio::sync::mpsc::channel::<WireMessage>(16);
             let datagrams_received = Arc::new(AtomicU64::new(0));
             let receiver_datagrams = datagrams_received.clone();
             let datagram_connection = connection.clone();
@@ -1731,11 +1948,42 @@ fn run_network_viewer(
                 let mut frame_reassembler = VideoDatagramReassembler::new();
                 let mut nal_reassembler = H264NalDatagramReassembler::new();
                 let mut completed_frames = 0_u64;
+                let rtt = datagram_connection.rtt();
+                let reorder_wait = (rtt / 4)
+                    .clamp(Duration::from_millis(2), Duration::from_millis(20));
+                let nack_retry_wait =
+                    rtt.clamp(Duration::from_millis(20), Duration::from_millis(100));
                 // The local path also supports negotiated per-NAL datagrams;
                 // the reassemblers below keep that capability while
                 // preserving the reliable keyframe queue.
                 loop {
-                    match datagram_connection.receive_datagram().await {
+                    if host_desktop_selective_retransmit {
+                        for nack in frame_reassembler.take_nacks(reorder_wait, nack_retry_wait) {
+                            if nack_tx
+                                .try_send(WireMessage::MediaNack {
+                                    sequence: nack.sequence,
+                                    missing_fragments: nack.missing_fragments,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    let received = if host_desktop_selective_retransmit {
+                        tokio::time::timeout(
+                            reorder_wait,
+                            datagram_connection.receive_datagram(),
+                        )
+                        .await
+                        .ok()
+                    } else {
+                        Some(datagram_connection.receive_datagram().await)
+                    };
+                    let Some(received) = received else {
+                        continue;
+                    };
+                    match received {
                         Ok(datagram) => {
                             let received_at = Instant::now();
                             let received_count = receiver_datagrams
@@ -1796,11 +2044,13 @@ fn run_network_viewer(
                                     &message,
                                     WireMessage::Video { keyframe: true, .. }
                                 );
+                                let desktop_update =
+                                    matches!(&message, WireMessage::DesktopUpdate { .. });
                                 let update = Ok(ReceivedFrame {
                                     message: Arc::new(message),
                                     received_at,
                                 });
-                                if keyframe {
+                                if keyframe || desktop_update {
                                     if video_tx.send(update).await.is_err() {
                                         break;
                                     }
@@ -1843,6 +2093,8 @@ fn run_network_viewer(
             let mut region_updates_presented = 0_u64;
             let mut region_rectangles_presented = 0_u64;
             let mut region_bytes_presented = 0_u64;
+            let mut nack_requests_sent = 0_u64;
+            let mut nack_fragments_requested = 0_u64;
             // Explicitly publish the selected profile's startup target so a
             // Host cannot accidentally begin at a cached rate from a prior
             // session.
@@ -1863,6 +2115,18 @@ fn run_network_viewer(
             let mut receive_to_present_total = Duration::ZERO;
             let mut report_started = Instant::now();
             while sink.is_open() {
+                while let Ok(nack) = nack_rx.try_recv() {
+                    if let WireMessage::MediaNack {
+                        missing_fragments,
+                        ..
+                    } = &nack
+                    {
+                        nack_requests_sent = nack_requests_sent.saturating_add(1);
+                        nack_fragments_requested = nack_fragments_requested
+                            .saturating_add(missing_fragments.len() as u64);
+                    }
+                    control.send(&nack).await?;
+                }
                 let update = match keyframe_rx.try_recv() {
                     Ok(update) => Some(update),
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
@@ -1947,6 +2211,28 @@ fn run_network_viewer(
                             return Err(DcError::Codec(
                                 "Host sent an unnegotiated desktop region update".into(),
                             ));
+                        }
+                        if sequence_gap {
+                            waiting_for_keyframe = true;
+                            if last_keyframe_request
+                                .is_none_or(|time| time.elapsed() >= Duration::from_secs(1))
+                            {
+                                control
+                                    .send(&WireMessage::KeyframeRequest {
+                                        last_sequence: last_sequence.unwrap_or_default(),
+                                    })
+                                    .await?;
+                                last_keyframe_request = Some(Instant::now());
+                            }
+                            log(
+                                LogLevel::Warn,
+                                "direct-computing::stream-viewer",
+                                &format!(
+                                    "rejected desktop region sequence={} because framebuffer base sequence {:?} is incomplete; requested reliable refresh",
+                                    sequence, last_sequence
+                                ),
+                            );
+                            continue;
                         }
                         let payload = decode_region_payload(received.message.as_ref())?;
                         let present_started = Instant::now();
@@ -2205,11 +2491,13 @@ fn run_network_viewer(
                         LogLevel::Info,
                         "direct-computing::stream-viewer",
                         &format!(
-                            "presented={} regions={} region_rects={} region_bytes={} dropped={} decode_avg={:.2}ms present_avg={:.2}ms receive_to_present_avg={:.2}ms",
+                            "presented={} regions={} region_rects={} region_bytes={} nack_requests={} nack_fragments={} dropped={} decode_avg={:.2}ms present_avg={:.2}ms receive_to_present_avg={:.2}ms",
                             presented,
                             region_updates_presented,
                             region_rectangles_presented,
                             region_bytes_presented,
+                            nack_requests_sent,
+                            nack_fragments_requested,
                             dropped,
                             average_millis(decode_total, presented),
                             average_millis(present_total, presented),
@@ -2220,6 +2508,8 @@ fn run_network_viewer(
                     region_updates_presented = 0;
                     region_rectangles_presented = 0;
                     region_bytes_presented = 0;
+                    nack_requests_sent = 0;
+                    nack_fragments_requested = 0;
                     dropped = 0;
                     decode_total = Duration::ZERO;
                     present_total = Duration::ZERO;
@@ -2496,5 +2786,44 @@ mod tests {
         assert!(!control.request_keyframe());
         control.acknowledge_keyframe();
         assert!(control.request_keyframe());
+    }
+
+    #[test]
+    fn retransmit_cache_returns_only_requested_fragments() {
+        let mut cache = MediaRetransmitCache::default();
+        cache.insert(9, &[vec![0], vec![1], vec![2], vec![3]]);
+        let fragments = cache
+            .fragments_for(&RetransmitRequest {
+                sequence: 9,
+                missing_fragments: vec![3, 1, 1, 99],
+            })
+            .unwrap();
+        assert_eq!(fragments, vec![vec![1], vec![3]]);
+        assert!(cache
+            .fragments_for(&RetransmitRequest {
+                sequence: 9,
+                missing_fragments: vec![0],
+            })
+            .is_some());
+        assert!(cache
+            .fragments_for(&RetransmitRequest {
+                sequence: 9,
+                missing_fragments: vec![0],
+            })
+            .is_none());
+        assert!(cache
+            .fragments_for(&RetransmitRequest {
+                sequence: 8,
+                missing_fragments: vec![0],
+            })
+            .is_none());
+        cache.insert(10, &[vec![4]]);
+        cache.updates.front_mut().unwrap().cached_at = Instant::now() - RETRANSMIT_CACHE_LIFETIME;
+        assert!(cache
+            .fragments_for(&RetransmitRequest {
+                sequence: 10,
+                missing_fragments: vec![0],
+            })
+            .is_some());
     }
 }

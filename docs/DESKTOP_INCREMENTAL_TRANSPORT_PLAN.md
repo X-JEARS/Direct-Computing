@@ -1,9 +1,14 @@
 # Direct Computing 桌面增量传输开发方案
 
-- 文档版本：0.1
-- 状态：设计草案，供阶段 3 桌面优化实现使用
+- 文档版本：0.2
+- 状态：分阶段实施中；当前已落地阶段 A 的基础指标和阶段 C 的 DCVD 选择性重传子集
 - 适用范围：Host 到 Viewer 的桌面图像传输
 - 现有基础：QUIC/TLS 1.3、可靠关键帧、QUIC DATAGRAM 普通帧、H.264 NAL 分片、DXGI dirty/move rect、PackBits 区域更新、独立光标
+
+当前 `hybrid-v5-selective-regions` 在保留兼容 `DesktopUpdate` 的前提下，已经加入独立能力
+协商、缺片 NACK、最终 Datagram 分片缓存和序列缺口保护。它是通往完整 stateful manifest
+的过渡实现：使用现有媒体 `sequence` 保护 framebuffer 顺序，但尚未替代本文设计的
+`epoch_id/base_state_id/state_id` 和原子 Manifest。
 
 ## 1. 结论
 
@@ -505,7 +510,7 @@ H.264，避免无损 BGRA Patch 占满链路。
 
 ### 阶段 A：可观测性与基准
 
-- [ ] 记录 dirty tile 数、变化面积、区域 wire size、H.264 wire size；
+- [x] 记录变化矩形数、累计变化像素、区域 wire size、H.264 wire size；
 - [ ] 记录每帧 NAL/Datagram 数、丢片、乱序、重组时间和显示 deadline；
 - [ ] 建立静止桌面、文字滚动、窗口拖动、网页滚动和视频播放数据集；
 - [ ] 确认当前 PackBits 与完整 H.264 的切换阈值。
@@ -520,15 +525,18 @@ H.264，避免无损 BGRA Patch 占满链路。
 - [ ] Host 只以已确认状态作为首版增量 base；
 - [ ] 实现状态不匹配时的可靠完整刷新。
 
+当前过渡保护：Viewer 发现 `DesktopUpdate` 媒体序列缺口时拒绝应用补丁并请求可靠 IDR，
+避免把区域数据覆盖到未知 framebuffer 基础。完整状态编号和累计 `StateAck` 仍待实现。
+
 验收：随机丢弃任意区域更新后，双方不会永久漂移，且能在限定时间内恢复。
 
 ### 阶段 C：分片 NACK 与发送缓存
 
-- [ ] 将 Datagram 标识扩展到 update/payload/fragment；
-- [ ] Viewer 生成合并的缺片范围；
-- [ ] Host 缓存并原样重发最终分片；
-- [ ] 增加基于 RTT、deadline、字节和状态窗口的淘汰；
-- [ ] 缓存过期时降级为区域刷新或可靠 IDR；
+- [x] 现有 DCVD 标识支持按媒体 sequence/fragment 请求缺片；完整 payload_id 格式仍待实现；
+- [x] Viewer 在 `RTT/4`（限制为 2-20 ms）的乱序等待后生成有界缺片列表，最多请求两轮，重试间隔为一个 RTT（限制为 20-100 ms）；
+- [x] Host 缓存并原样重发最终 DCVD 分片；
+- [x] 增加 1.5 秒、8 MiB、8 个 update 的组合淘汰上限；
+- [x] 缓存过期时降级为可靠 IDR；
 - [ ] 重传带宽纳入码率预算。
 
 验收：1%-5% 随机丢包下，大部分小区域更新无需完整 IDR 即可恢复，且延迟不持续累积。
