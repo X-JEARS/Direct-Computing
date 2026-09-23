@@ -68,8 +68,10 @@ To verify dirty-region detection and transport on either Viewer, add
 ```
 
 The Viewer outlines every region in the latest `DesktopUpdate` in bright green. The overlay is
-local, is disabled by default, and is cleared by the next full H.264 frame, so it does not alter
-the Host framebuffer or encoded stream.
+local, is disabled by default, and remains visible for 300 milliseconds even if a full H.264 frame
+arrives in the meantime. It does not alter the Host framebuffer or encoded stream. The Host no
+longer rejects a region update based on changed-area percentage; its encoded payload is allowed to
+grow to 256 KiB before falling back to a full H.264 frame.
 
 At startup, confirm that the Viewer reports:
 

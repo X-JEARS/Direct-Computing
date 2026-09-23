@@ -2,8 +2,8 @@ use dc_auth::{PasswordVerifier, Permissions};
 use dc_common::{init_logging, log, DcError, LogLevel, Result};
 use dc_desktop::validate_input;
 use dc_desktop::{
-    changed_area, classify_video_datagram, decode_region_payload, encode_region_update,
-    packet_to_message, packetize_h264_nal_message, packetize_video_message, DirtyRegionDetector,
+    classify_video_datagram, decode_region_payload, encode_region_update, packet_to_message,
+    packetize_h264_nal_message, packetize_video_message, DirtyRegionDetector,
     H264NalDatagramReassembler, VideoDatagramKind, VideoDatagramReassembler,
 };
 #[cfg(target_os = "windows")]
@@ -26,7 +26,7 @@ use dc_protocol::PROTOCOL_VERSION;
 use dc_protocol::{Capabilities, WireMessage};
 use dc_session::{authenticate_client, authenticate_server};
 use dc_transport::{format_fingerprint, parse_fingerprint, QuicClient, QuicConnection, QuicServer};
-use dc_ui::PreviewWindowSink;
+use dc_ui::{PreviewWindowSink, DIRTY_REGION_DEBUG_HOLD};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -85,8 +85,7 @@ const STARTUP_ZERO_FRAME_GRACE: Duration = Duration::from_secs(2);
 const NETWORK_CHROMA_SUBSAMPLING: &str = "4:2:0";
 const MEDIA_PROTOCOL_REVISION: &str = "hybrid-v4-h264-nal-regions";
 const FULL_FRAME_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-const REGION_UPDATE_MAX_AREA_PERCENT: u64 = 35;
-const REGION_UPDATE_MAX_BYTES: usize = 64 * 1024;
+const REGION_UPDATE_MAX_BYTES: usize = 256 * 1024;
 
 struct StreamControl {
     profile: RateProfile,
@@ -791,6 +790,9 @@ where
         let mut captured = 0_u64;
         let mut encoded = 0_u64;
         let mut region_updates = 0_u64;
+        let mut region_rectangles = 0_u64;
+        let mut region_bytes = 0_u64;
+        let mut oversized_region_updates = 0_u64;
         let mut cursor_updates = 0_u64;
         let mut unchanged_skipped = 0_u64;
         let mut media_sequence = 0_u64;
@@ -889,14 +891,10 @@ where
                     encoder = create_encoder(&frame, current_bitrate, current_fps, max_slice_len)?;
                 }
             }
-            let frame_area = u64::from(frame.layout().size().width())
-                * u64::from(frame.layout().size().height());
             let region_candidate = desktop_optimizations
                 && !force_full_frame
                 && !dirty_regions.is_empty()
-                && last_full_frame_at.elapsed() < FULL_FRAME_REFRESH_INTERVAL
-                && changed_area(&dirty_regions).saturating_mul(100)
-                    <= frame_area.saturating_mul(REGION_UPDATE_MAX_AREA_PERCENT);
+                && last_full_frame_at.elapsed() < FULL_FRAME_REFRESH_INTERVAL;
             let region_update = if region_candidate {
                 let message = Arc::new(encode_region_update(
                     &frame,
@@ -904,7 +902,12 @@ where
                     media_sequence,
                 )?);
                 let encoded_bytes = message.encode()?.len();
-                (encoded_bytes <= REGION_UPDATE_MAX_BYTES).then_some((message, encoded_bytes))
+                if encoded_bytes <= REGION_UPDATE_MAX_BYTES {
+                    Some((message, encoded_bytes))
+                } else {
+                    oversized_region_updates = oversized_region_updates.saturating_add(1);
+                    None
+                }
             } else {
                 None
             };
@@ -922,6 +925,9 @@ where
                     Ok(()) => {
                         encoded = encoded.saturating_add(1);
                         region_updates = region_updates.saturating_add(1);
+                        region_rectangles = region_rectangles
+                            .saturating_add(u64::try_from(dirty_regions.len()).unwrap_or(u64::MAX));
+                        region_bytes = region_bytes.saturating_add(encoded_bytes as u64);
                     }
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         queue_dropped = queue_dropped.saturating_add(1);
@@ -1003,10 +1009,13 @@ where
                     LogLevel::Info,
                     "direct-computing::stream-host",
                     &format!(
-                        "capture={} encoded={} regions={} cursors={} unchanged_skipped={} queue_dropped={} capture_avg={:.2}ms encode_avg={:.2}ms",
+                        "capture={} encoded={} regions={} region_rects={} region_bytes={} region_oversized={} cursors={} unchanged_skipped={} queue_dropped={} capture_avg={:.2}ms encode_avg={:.2}ms",
                         captured,
                         encoded,
                         region_updates,
+                        region_rectangles,
+                        region_bytes,
+                        oversized_region_updates,
                         cursor_updates,
                         unchanged_skipped,
                         queue_dropped,
@@ -1017,6 +1026,9 @@ where
                 captured = 0;
                 encoded = 0;
                 region_updates = 0;
+                region_rectangles = 0;
+                region_bytes = 0;
+                oversized_region_updates = 0;
                 cursor_updates = 0;
                 unchanged_skipped = 0;
                 queue_dropped = 0;
@@ -1649,6 +1661,16 @@ fn run_network_viewer(
             let mut decoder = create_viewer_decoder()?;
             let mut sink = PreviewWindowSink::new("Direct Computing - Remote Desktop");
             sink.set_dirty_region_debug(show_dirty_regions);
+            if show_dirty_regions {
+                log(
+                    LogLevel::Info,
+                    "direct-computing::stream-viewer",
+                    &format!(
+                        "dirty region overlay enabled hold_ms={}",
+                        DIRTY_REGION_DEBUG_HOLD.as_millis()
+                    ),
+                );
+            }
             sink.show_placeholder(640, 360)?;
             log(
                 LogLevel::Info,
@@ -1818,6 +1840,9 @@ fn run_network_viewer(
             let mut requested_fps = profile.initial_fps as u16;
             let mut stable_inter_frames = 0_u32;
             let mut stable_since = Instant::now();
+            let mut region_updates_presented = 0_u64;
+            let mut region_rectangles_presented = 0_u64;
+            let mut region_bytes_presented = 0_u64;
             // Explicitly publish the selected profile's startup target so a
             // Host cannot accidentally begin at a cached rate from a prior
             // session.
@@ -1934,6 +1959,11 @@ fn run_network_viewer(
                         present_total += present_started.elapsed();
                         receive_to_present_total += received.received_at.elapsed();
                         presented = presented.saturating_add(1);
+                        region_updates_presented = region_updates_presented.saturating_add(1);
+                        region_rectangles_presented = region_rectangles_presented
+                            .saturating_add(u64::try_from(regions.len()).unwrap_or(u64::MAX));
+                        region_bytes_presented =
+                            region_bytes_presented.saturating_add(payload.len() as u64);
                         last_sequence = Some(*sequence);
                         stable_inter_frames = stable_inter_frames.saturating_add(1);
                         continue;
@@ -2143,7 +2173,7 @@ fn run_network_viewer(
                         ),
                     );
                 }
-                sink.pump_events();
+                sink.pump_events()?;
                 if let Some((width, height)) = desktop_size {
                     // Pointer motion is state, not a queue. Coalesce multiple
                     // moves observed during one UI tick while preserving key
@@ -2175,8 +2205,11 @@ fn run_network_viewer(
                         LogLevel::Info,
                         "direct-computing::stream-viewer",
                         &format!(
-                            "presented={} dropped={} decode_avg={:.2}ms present_avg={:.2}ms receive_to_present_avg={:.2}ms",
+                            "presented={} regions={} region_rects={} region_bytes={} dropped={} decode_avg={:.2}ms present_avg={:.2}ms receive_to_present_avg={:.2}ms",
                             presented,
+                            region_updates_presented,
+                            region_rectangles_presented,
+                            region_bytes_presented,
                             dropped,
                             average_millis(decode_total, presented),
                             average_millis(present_total, presented),
@@ -2184,6 +2217,9 @@ fn run_network_viewer(
                         ),
                     );
                     presented = 0;
+                    region_updates_presented = 0;
+                    region_rectangles_presented = 0;
+                    region_bytes_presented = 0;
                     dropped = 0;
                     decode_total = Duration::ZERO;
                     present_total = Duration::ZERO;
@@ -2306,10 +2342,10 @@ where
         let frames_before = pipeline.stats().frames_processed;
         match pipeline.process_next_frame() {
             Ok(stats) if stats.frames_processed == frames_before => {
-                pipeline.sink_mut().pump_events();
+                pipeline.sink_mut().pump_events()?;
             }
             Ok(_) => {}
-            Err(DcError::Timeout(_)) => pipeline.sink_mut().pump_events(),
+            Err(DcError::Timeout(_)) => pipeline.sink_mut().pump_events()?,
             Err(error) => return Err(error),
         }
 

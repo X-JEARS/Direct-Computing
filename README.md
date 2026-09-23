@@ -137,8 +137,9 @@ desktop framebuffer or the pixels sent by the Host:
 .\direct-computing.exe --show-dirty-regions --connect <host>:22100 '<password>' '<cert-sha256>'
 ```
 
-The overlay is disabled by default and is intended only for testing dirty-region detection and
-transport.
+The overlay is disabled by default, remains visible for 300 milliseconds, and is intended only for
+testing dirty-region detection and transport. Dirty-region updates have no changed-area cutoff and
+may use up to 256 KiB of encoded payload before falling back to a full H.264 frame.
 
 Pass duration `0` to keep the preview open until the window is closed or Escape is pressed. The
 window title and console report FPS, skipped frames, throughput, and capture/encode/decode/display

@@ -2,7 +2,7 @@
 
 mod preview;
 
-pub use preview::PreviewWindowSink;
+pub use preview::{PreviewWindowSink, DIRTY_REGION_DEBUG_HOLD};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApplicationRole {

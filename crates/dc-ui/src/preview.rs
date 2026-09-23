@@ -5,12 +5,14 @@ use dc_platform::window_view_geometry;
 use dc_platform::{local_screen_size, InputEventSource};
 use dc_protocol::{CursorShape, DesktopRect, InputEvent, KeyboardKey};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
+use std::time::{Duration, Instant};
 
 const MAX_INITIAL_WIDTH: usize = 1_280;
 const MAX_INITIAL_HEIGHT: usize = 720;
 const WINDOW_DECORATION_HEIGHT: usize = 80;
 const WINDOWS_WHEEL_DELTA: f32 = 120.0;
 const MAX_WHEEL_DELTA_PER_EVENT: f32 = WINDOWS_WHEEL_DELTA * 100.0;
+pub const DIRTY_REGION_DEBUG_HOLD: Duration = Duration::from_millis(300);
 
 pub struct PreviewWindowSink {
     base_title: String,
@@ -23,6 +25,7 @@ pub struct PreviewWindowSink {
     remote_cursor: RemoteCursor,
     dirty_region_debug: bool,
     dirty_regions: Vec<DesktopRect>,
+    dirty_regions_until: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -46,6 +49,7 @@ impl PreviewWindowSink {
             remote_cursor: RemoteCursor::default(),
             dirty_region_debug: false,
             dirty_regions: Vec::new(),
+            dirty_regions_until: None,
         }
     }
 
@@ -70,12 +74,16 @@ impl PreviewWindowSink {
         self.window.as_ref().is_none_or(Window::is_open)
     }
 
-    pub fn pump_events(&mut self) {
+    pub fn pump_events(&mut self) -> Result<()> {
+        if self.expire_dirty_region_debug(Instant::now()) {
+            self.render_composited()?;
+        }
         if let Some(window) = &mut self.window {
             window.update();
             #[cfg(target_os = "macos")]
             let _ = window_view_geometry(window.get_window_handle() as usize);
         }
+        Ok(())
     }
 
     /// Drain local keyboard and pointer events observed by the preview window.
@@ -166,6 +174,7 @@ impl PreviewWindowSink {
         self.dirty_region_debug = enabled;
         if !enabled {
             self.dirty_regions.clear();
+            self.dirty_regions_until = None;
         }
     }
 
@@ -235,6 +244,7 @@ impl PreviewWindowSink {
         }
         if self.dirty_region_debug {
             self.dirty_regions = regions.to_vec();
+            self.dirty_regions_until = Some(Instant::now() + DIRTY_REGION_DEBUG_HOLD);
         }
         self.render_composited()
     }
@@ -257,6 +267,7 @@ impl PreviewWindowSink {
     }
 
     fn render_composited(&mut self) -> Result<()> {
+        self.expire_dirty_region_debug(Instant::now());
         let Some((width, height)) = self.frame_size else {
             return Ok(());
         };
@@ -271,6 +282,19 @@ impl PreviewWindowSink {
                 .map_err(|error| DcError::Platform(format!("update preview window: {error}")))?;
         }
         Ok(())
+    }
+
+    fn expire_dirty_region_debug(&mut self, now: Instant) -> bool {
+        if self
+            .dirty_regions_until
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.dirty_regions.clear();
+            self.dirty_regions_until = None;
+            true
+        } else {
+            false
+        }
     }
 
     fn ensure_window(&mut self, width: usize, height: usize) -> Result<&mut Window> {
@@ -465,6 +489,13 @@ impl FrameSink for PreviewWindowSink {
         let layout = frame.layout();
         let width = layout.size().width() as usize;
         let height = layout.size().height() as usize;
+        if self
+            .frame_size
+            .is_some_and(|dimensions| dimensions != (width, height))
+        {
+            self.dirty_regions.clear();
+            self.dirty_regions_until = None;
+        }
         // The placeholder is only a bootstrap surface. Recreate it at the
         // first decoded frame's native size so a fitting remote desktop is
         // shown 1:1 instead of remaining a 640x360 scaled window.
@@ -474,7 +505,6 @@ impl FrameSink for PreviewWindowSink {
         }
         self.ensure_window(width, height)?;
         self.frame_size = Some((width, height));
-        self.dirty_regions.clear();
         convert_to_minifb(&frame, &mut self.desktop_pixels)?;
         self.render_composited()
     }
@@ -808,6 +838,15 @@ mod tests {
         assert_eq!(sink.desktop_pixels[4], 0x00aabbcc);
         assert_eq!(sink.pixels[4], 0x0000_ff40);
         assert_eq!(sink.desktop_pixels[0], 0x00112233);
+
+        sink.desktop_pixels.fill(0x00445566);
+        sink.render_composited().unwrap();
+        assert_eq!(sink.pixels[4], 0x0000_ff40);
+
+        sink.dirty_regions_until = Some(Instant::now() - Duration::from_millis(1));
+        assert!(sink.expire_dirty_region_debug(Instant::now()));
+        sink.render_composited().unwrap();
+        assert_eq!(sink.pixels[4], 0x00445566);
     }
 
     #[test]
