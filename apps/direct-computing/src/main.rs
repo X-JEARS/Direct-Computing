@@ -585,12 +585,29 @@ impl dc_media::VideoDecoder for MacViewerDecoder {
             match dc_media::VideoDecoder::decode(decoder, packet.clone()) {
                 Ok(frame) => return Ok(frame),
                 Err(error) => {
+                    // Inter frames can legitimately become undecodable after
+                    // loss on the QUIC DATAGRAM lane. Keep VideoToolbox alive
+                    // so the viewer can recover on the next keyframe instead
+                    // of permanently falling back to software after one gap.
+                    if !packet.is_keyframe() {
+                        return Err(error);
+                    }
                     log(
                         LogLevel::Warn,
                         "direct-computing::stream-viewer",
-                        &format!("VideoToolbox decode failed, switching to OpenH264: {error}"),
+                        &format!("VideoToolbox keyframe decode failed, trying OpenH264: {error}"),
                     );
-                    self.hardware = None;
+                    match dc_media::VideoDecoder::decode(&mut self.fallback, packet) {
+                        Ok(frame) => {
+                            self.hardware = None;
+                            return Ok(frame);
+                        }
+                        Err(fallback_error) => {
+                            return Err(DcError::Codec(format!(
+                                "VideoToolbox decode failed: {error}; OpenH264 fallback failed: {fallback_error}"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -789,13 +806,14 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
             // Video is carried over an unreliable, unordered QUIC DATAGRAM
             // lane. Incomplete or stale frames are discarded by the
             // reassembler; control/input continue using the reliable stream.
-            let (video_tx, mut video_rx) = tokio::sync::watch::channel::<
-                Option<std::result::Result<ReceivedFrame, String>>,
-            >(None);
+            let (video_tx, mut video_rx) = tokio::sync::mpsc::channel::<
+                std::result::Result<ReceivedFrame, String>,
+            >(4);
             let datagram_connection = connection.clone();
             tokio::spawn(async move {
                 let mut reassembler = VideoDatagramReassembler::new();
                 let mut datagrams_received = 0_u64;
+                let mut first_complete_logged = false;
                 loop {
                     let received_at = Instant::now();
                     match datagram_connection.receive_datagram().await {
@@ -813,39 +831,61 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                                 );
                             }
                             match reassembler.push(&datagram) {
-                            Ok(Some(message)) => {
-                                log(
-                                    LogLevel::Info,
-                                    "direct-computing::stream-viewer",
-                                    &format!(
-                                        "received complete video frame after {} datagrams",
-                                        datagrams_received
-                                    ),
-                                );
-                                if video_tx
-                                    .send(Some(Ok(ReceivedFrame {
+                                Ok(Some(message)) => {
+                                    if !first_complete_logged {
+                                        log(
+                                            LogLevel::Info,
+                                            "direct-computing::stream-viewer",
+                                            &format!(
+                                                "received first complete video frame after {} datagrams",
+                                                datagrams_received
+                                            ),
+                                        );
+                                        first_complete_logged = true;
+                                    }
+                                    let keyframe = matches!(
+                                        &message,
+                                        WireMessage::Video { keyframe: true, .. }
+                                    );
+                                    let update = Ok(ReceivedFrame {
                                         message: Arc::new(message),
                                         received_at,
-                                    })))
-                                    .is_err()
-                                {
-                                    break;
+                                    });
+                                    if keyframe {
+                                        // A recovery keyframe must never be
+                                        // overwritten by a newer inter frame.
+                                        if video_tx.send(update).await.is_err() {
+                                            break;
+                                        }
+                                    } else {
+                                        match video_tx.try_send(update) {
+                                            Ok(()) => {}
+                                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                // Stale inter frames are
+                                                // intentionally disposable.
+                                            }
+                                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                                break;
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                            Ok(None) => continue,
-                            Err(error) => {
-                                log(
-                                    LogLevel::Warn,
-                                    "direct-computing::stream-viewer",
-                                    &format!("video datagram rejected: {error}"),
-                                );
-                                let _ = video_tx.send(Some(Err(error.to_string())));
-                                break;
-                            }
+                                Ok(None) => continue,
+                                Err(error) => {
+                                    // QUIC authenticates each datagram, but a
+                                    // stale or incompatible media fragment is
+                                    // still isolated media loss. Do not tear
+                                    // down the reliable control session.
+                                    log(
+                                        LogLevel::Warn,
+                                        "direct-computing::stream-viewer",
+                                        &format!("dropping rejected video datagram: {error}"),
+                                    );
+                                }
                             }
                         }
                         Err(error) => {
-                            let _ = video_tx.send(Some(Err(error.to_string())));
+                            let _ = video_tx.send(Err(error.to_string())).await;
                             break;
                         }
                     }
@@ -854,6 +894,7 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
             let mut last_sequence: Option<u64> = None;
             let mut last_keyframe_request: Option<Instant> = None;
             let mut last_frame_progress = Instant::now();
+            let mut waiting_for_keyframe = true;
             let mut packet_logged = false;
             let mut decoded_logged = false;
             let mut presented = 0_u64;
@@ -865,12 +906,12 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
             while sink.is_open() {
                 let update = match tokio::time::timeout(
                     Duration::from_millis(16),
-                    video_rx.changed(),
+                    video_rx.recv(),
                 )
                 .await
                 {
-                    Ok(Ok(())) => video_rx.borrow_and_update().clone(),
-                    Ok(Err(_)) => {
+                    Ok(Some(update)) => Some(update),
+                    Ok(None) => {
                         return Err(DcError::Platform(
                             "video datagram receiver closed".into(),
                         ));
@@ -888,24 +929,16 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                         }
                     };
                     let sequence = video_sequence(received.message.as_ref());
+                    let mut sequence_gap = false;
                     if let (Some(previous), Some(current)) = (last_sequence, sequence) {
                         let gap = current.saturating_sub(previous.saturating_add(1));
                         dropped += gap;
-                        if gap > 0
-                            && last_keyframe_request
-                                .is_none_or(|time| time.elapsed() >= Duration::from_secs(2))
-                        {
-                            control
-                                .send(&WireMessage::KeyframeRequest {
-                                    last_sequence: previous,
-                                })
-                                .await?;
-                            last_keyframe_request = Some(Instant::now());
-                        }
+                        sequence_gap = gap > 0;
                     }
                     last_sequence = sequence;
                     let decode_started = Instant::now();
                     let packet = dc_desktop::message_to_packet_ref(received.message.as_ref())?;
+                    let keyframe = packet.is_keyframe();
                     desktop_size = Some((
                         packet.source_layout().size().width(),
                         packet.source_layout().size().height(),
@@ -931,11 +964,42 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                         );
                         packet_logged = true;
                     }
+                    if sequence_gap {
+                        waiting_for_keyframe = true;
+                    }
+                    if waiting_for_keyframe && !keyframe {
+                        if last_keyframe_request
+                            .is_none_or(|time| time.elapsed() >= Duration::from_secs(1))
+                        {
+                            control
+                                .send(&WireMessage::KeyframeRequest {
+                                    last_sequence: sequence.unwrap_or_default(),
+                                })
+                                .await?;
+                            last_keyframe_request = Some(Instant::now());
+                            log(
+                                LogLevel::Debug,
+                                "direct-computing::stream-viewer",
+                                "waiting for a recovery keyframe; dropped dependent frame",
+                            );
+                        }
+                        continue;
+                    }
+                    if waiting_for_keyframe {
+                        // Reset VideoToolbox/OpenH264 before consuming the
+                        // recovery keyframe so no references from the damaged
+                        // GOP survive into the new decode chain.
+                        decoder = create_viewer_decoder()?;
+                    }
                     let frame = match decoder.decode(packet) {
-                        Ok(frame) => frame,
+                        Ok(frame) => {
+                            waiting_for_keyframe = false;
+                            frame
+                        }
                         Err(error) => {
+                            waiting_for_keyframe = true;
                             if last_keyframe_request
-                                .is_none_or(|time| time.elapsed() >= Duration::from_secs(2))
+                                .is_none_or(|time| time.elapsed() >= Duration::from_secs(1))
                             {
                                 control
                                     .send(&WireMessage::KeyframeRequest {
@@ -983,7 +1047,7 @@ fn run_network_viewer(address: &str, password: &str, fingerprint: Option<&str>) 
                 }
                 if last_frame_progress.elapsed() >= Duration::from_secs(1)
                     && last_keyframe_request
-                        .is_none_or(|time| time.elapsed() >= Duration::from_secs(2))
+                        .is_none_or(|time| time.elapsed() >= Duration::from_secs(1))
                 {
                     control
                         .send(&WireMessage::KeyframeRequest {

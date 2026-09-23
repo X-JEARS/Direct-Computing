@@ -1,5 +1,7 @@
 use dc_common::{DcError, Result};
 use dc_media::{FrameSink, PixelFormat, VideoFrame};
+#[cfg(target_os = "macos")]
+use dc_platform::window_view_geometry;
 use dc_platform::InputEventSource;
 use dc_protocol::InputEvent;
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, ScaleMode, Window, WindowOptions};
@@ -52,6 +54,8 @@ impl PreviewWindowSink {
     pub fn pump_events(&mut self) {
         if let Some(window) = &mut self.window {
             window.update();
+            #[cfg(target_os = "macos")]
+            let _ = window_view_geometry(window.get_window_handle() as usize);
         }
     }
 
@@ -63,8 +67,23 @@ impl PreviewWindowSink {
             return Vec::new();
         };
         let mut events = Vec::new();
+        #[cfg(target_os = "macos")]
+        let macos_geometry = window_view_geometry(window.get_window_handle() as usize);
         if let Some((mouse_x, mouse_y)) = window.get_unscaled_mouse_pos(MouseMode::Clamp) {
-            let (window_width, window_height) = window.get_size();
+            let (window_width, window_height, mouse_x, mouse_y) = {
+                #[cfg(target_os = "macos")]
+                if let Some((width, height, x, y)) = macos_geometry {
+                    (width, height, x, y)
+                } else {
+                    let (width, height) = window.get_size();
+                    (width, height, mouse_x, mouse_y)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let (width, height) = window.get_size();
+                    (width, height, mouse_x, mouse_y)
+                }
+            };
             let (frame_width, frame_height) = self
                 .frame_size
                 .unwrap_or((window_width.max(1), window_height.max(1)));
@@ -199,6 +218,10 @@ impl FrameSink for PreviewWindowSink {
         self.ensure_window(width, height)?;
         self.frame_size = Some((width, height));
         convert_to_minifb(&frame, &mut self.pixels)?;
+        #[cfg(target_os = "macos")]
+        if let Some(window) = &self.window {
+            let _ = window_view_geometry(window.get_window_handle() as usize);
+        }
         self.window
             .as_mut()
             .ok_or_else(|| DcError::Platform("preview window was not created".into()))?

@@ -651,6 +651,8 @@ VideoToolbox 的完整能力矩阵和零拷贝渲染、HEVC/AV1 以及安装包�
 - [x] 不支持强制 IDR 的编码器通过重建编码器恢复 GOP；静止桌面使用最近帧生成递增时间戳的恢复帧
 - [x] Viewer 在无完整帧、序号间隔或解码失败时自动请求关键帧
 - [x] 关键帧 Datagram 分片进行一次冗余发送，降低单个分片丢失导致首帧无法重组的概率
+- [x] Viewer 使用有界解码队列保留恢复关键帧、丢弃过期依赖帧；序号断档后等待新关键帧并重建解码器
+- [x] macOS Viewer 使用标题栏下方的内容布局呈现画面，鼠标只按实际视频矩形映射并忽略黑边
 - [ ] 关键帧可靠传输或 FEC/分片重传，适配高丢包和低带宽链路
 - [ ] 完成 QUIC DATAGRAM 接收计数、分片丢失率和恢复时间的双机实测
 - [x] RTT/丢包/队列/编码耗时驱动的基础码率控制器
@@ -661,6 +663,10 @@ VideoToolbox 的完整能力矩阵和零拷贝渲染、HEVC/AV1 以及安装包�
 Windows Host → macOS Viewer 可以先作为跨平台集成测试：Windows 使用 DXGI 采集，macOS 使用
 通用 Viewer 窗口解码并回传输入。该测试不替代 Windows ↔ Windows 长时间基准；macOS Host
 原生屏幕采集仍属于后续跨平台阶段。
+
+2026-09-22 的 Windows Host → macOS Viewer 联调已确认新 QUIC DATAGRAM 路径能够持续接收并
+呈现数据，窗口缩放后的鼠标指向与 Host 一致；标题栏和宽高比产生的黑边不参与远端坐标映射。
+高丢包恢复时间、15 分钟以上稳定性和 1080p/30 P95 延迟仍需按专项测试清单记录。
 
 当前可通过 `direct-computing --host [addr] <password>` 启动 Host，通过
 `direct-computing --connect <addr> <password> [cert-sha256]` 启动 Viewer；首次连接会显示
