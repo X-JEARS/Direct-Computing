@@ -296,6 +296,9 @@ QUIC/TLS 1.3
 阻塞操作。当前没有必要为了媒体协议而更换 QUIC，后续只需继续评估普通帧的 FEC、
 分片重传和帧内刷新策略。
 
+桌面增量状态、`CopyRect`、选择性分片重传、ACK/NACK、缓存淘汰和恢复状态机的具体演进
+方案见 `docs/DESKTOP_INCREMENTAL_TRANSPORT_PLAN.md`。
+
 ### 6.4 首帧、静止桌面和恢复策略
 
 Windows Desktop Duplication 在桌面没有变化时可能持续超时。当前实现已经覆盖：

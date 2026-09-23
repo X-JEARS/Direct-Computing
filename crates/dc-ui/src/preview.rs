@@ -21,6 +21,8 @@ pub struct PreviewWindowSink {
     last_pointer: Option<(i32, i32, u8)>,
     scroll_remainder: (f32, f32),
     remote_cursor: RemoteCursor,
+    dirty_region_debug: bool,
+    dirty_regions: Vec<DesktopRect>,
 }
 
 #[derive(Default)]
@@ -42,6 +44,8 @@ impl PreviewWindowSink {
             last_pointer: None,
             scroll_remainder: (0.0, 0.0),
             remote_cursor: RemoteCursor::default(),
+            dirty_region_debug: false,
+            dirty_regions: Vec::new(),
         }
     }
 
@@ -158,6 +162,13 @@ impl PreviewWindowSink {
         }
     }
 
+    pub fn set_dirty_region_debug(&mut self, enabled: bool) {
+        self.dirty_region_debug = enabled;
+        if !enabled {
+            self.dirty_regions.clear();
+        }
+    }
+
     /// Create a visible placeholder surface before the first decoded frame.
     /// This keeps the Viewer window discoverable while the first keyframe is
     /// being reassembled over the lossy media lane.
@@ -222,6 +233,9 @@ impl PreviewWindowSink {
                 "desktop update payload has trailing bytes".into(),
             ));
         }
+        if self.dirty_region_debug {
+            self.dirty_regions = regions.to_vec();
+        }
         self.render_composited()
     }
 
@@ -247,6 +261,9 @@ impl PreviewWindowSink {
             return Ok(());
         };
         self.pixels.clone_from(&self.desktop_pixels);
+        if self.dirty_region_debug {
+            draw_dirty_regions(&mut self.pixels, width, height, &self.dirty_regions);
+        }
         draw_cursor(&mut self.pixels, width, height, &self.remote_cursor);
         if let Some(window) = &mut self.window {
             window
@@ -457,6 +474,7 @@ impl FrameSink for PreviewWindowSink {
         }
         self.ensure_window(width, height)?;
         self.frame_size = Some((width, height));
+        self.dirty_regions.clear();
         convert_to_minifb(&frame, &mut self.desktop_pixels)?;
         self.render_composited()
     }
@@ -497,6 +515,55 @@ fn validate_cursor_shape(shape: &CursorShape) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn draw_dirty_regions(output: &mut [u32], width: usize, height: usize, regions: &[DesktopRect]) {
+    const COLOR: u32 = 0x0000_ff40;
+    const THICKNESS: usize = 2;
+    for region in regions {
+        if region.width == 0 || region.height == 0 {
+            continue;
+        }
+        let left = region.x as usize;
+        let top = region.y as usize;
+        if left >= width || top >= height {
+            continue;
+        }
+        let right = left
+            .saturating_add(region.width as usize)
+            .saturating_sub(1)
+            .min(width - 1);
+        let bottom = top
+            .saturating_add(region.height as usize)
+            .saturating_sub(1)
+            .min(height - 1);
+        for offset in 0..THICKNESS {
+            let top_row = top.saturating_add(offset);
+            let bottom_row = bottom.saturating_sub(offset);
+            if top_row <= bottom {
+                for x in left..=right {
+                    output[top_row * width + x] = COLOR;
+                }
+            }
+            if bottom_row >= top {
+                for x in left..=right {
+                    output[bottom_row * width + x] = COLOR;
+                }
+            }
+            let left_col = left.saturating_add(offset);
+            let right_col = right.saturating_sub(offset);
+            if left_col <= right {
+                for y in top..=bottom {
+                    output[y * width + left_col] = COLOR;
+                }
+            }
+            if right_col >= left {
+                for y in top..=bottom {
+                    output[y * width + right_col] = COLOR;
+                }
+            }
+        }
+    }
 }
 
 fn draw_cursor(output: &mut [u32], width: usize, height: usize, cursor: &RemoteCursor) {
@@ -718,6 +785,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sink.desktop_pixels, vec![0x00112233, 0x00aabbcc]);
+    }
+
+    #[test]
+    fn dirty_region_debug_draws_overlay_without_polluting_desktop() {
+        let mut sink = PreviewWindowSink::new("test");
+        sink.frame_size = Some((3, 3));
+        sink.desktop_pixels = vec![0x00112233; 9];
+        sink.set_dirty_region_debug(true);
+        sink.apply_bgra_regions(
+            3,
+            3,
+            &[DesktopRect {
+                x: 1,
+                y: 1,
+                width: 1,
+                height: 1,
+            }],
+            &[0xcc, 0xbb, 0xaa, 0xff],
+        )
+        .unwrap();
+        assert_eq!(sink.desktop_pixels[4], 0x00aabbcc);
+        assert_eq!(sink.pixels[4], 0x0000_ff40);
+        assert_eq!(sink.desktop_pixels[0], 0x00112233);
     }
 
     #[test]

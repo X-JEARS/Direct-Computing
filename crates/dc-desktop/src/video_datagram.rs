@@ -15,6 +15,24 @@ const NAL_HEADER_LEN: usize = 48;
 const MAX_NAL_UNITS: usize = 4_096;
 const MAX_NAL_FRAGMENTS: usize = 16_384;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VideoDatagramKind {
+    Legacy,
+    H264Nal,
+}
+
+/// Identify the envelope before selecting a reassembler. NAL capability
+/// negotiation does not change the envelope used by desktop-region updates.
+pub fn classify_video_datagram(datagram: &[u8]) -> Option<VideoDatagramKind> {
+    if datagram.len() >= 5 && datagram[..4] == NAL_MAGIC && datagram[4] == NAL_VERSION {
+        Some(VideoDatagramKind::H264Nal)
+    } else if datagram.len() >= 5 && datagram[..4] == MAGIC && datagram[4] == VERSION {
+        Some(VideoDatagramKind::Legacy)
+    } else {
+        None
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PartialNalUnit {
     total_len: usize,
@@ -623,6 +641,47 @@ mod tests {
         }
         assert_eq!(result, Some(message));
         assert_eq!(reassembler.stats().completed_frames, 1);
+    }
+
+    #[test]
+    fn classifies_nal_and_legacy_datagram_envelopes() {
+        let h264 = WireMessage::Video {
+            codec: 1,
+            sequence: 12,
+            timestamp_millis: 42,
+            keyframe: false,
+            width: 64,
+            height: 48,
+            pixel_format: 1,
+            stride: 256,
+            data: [&[0, 0, 0, 1, 0x41][..], &[0x5a; 32]].concat(),
+        };
+        let desktop_update = WireMessage::DesktopUpdate {
+            sequence: 13,
+            timestamp_millis: 43,
+            desktop_width: 64,
+            desktop_height: 48,
+            encoding: 0,
+            regions: vec![dc_protocol::DesktopRect {
+                x: 8,
+                y: 8,
+                width: 4,
+                height: 4,
+            }],
+            data: vec![0x5a; 64],
+        };
+        let nal = packetize_h264_nal_message(&h264, 300).unwrap();
+        let legacy = packetize_video_message(&desktop_update, 300).unwrap();
+
+        assert_eq!(
+            classify_video_datagram(&nal[0]),
+            Some(VideoDatagramKind::H264Nal)
+        );
+        assert_eq!(
+            classify_video_datagram(&legacy[0]),
+            Some(VideoDatagramKind::Legacy)
+        );
+        assert_eq!(classify_video_datagram(b"bad"), None);
     }
 
     #[test]

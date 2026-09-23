@@ -60,6 +60,17 @@ preferring a hardware decoder MFT and falling back to OpenH264 when no usable
 MFT is available. The log identifies the selected backend and reports whether
 `hardware=true`.
 
+To verify dirty-region detection and transport on either Viewer, add
+`--show-dirty-regions` before `--connect`:
+
+```powershell
+.\direct-computing.exe --show-dirty-regions --connect <windows-ip>:22100 '<password>' '<cert-sha256>'
+```
+
+The Viewer outlines every region in the latest `DesktopUpdate` in bright green. The overlay is
+local, is disabled by default, and is cleared by the next full H.264 frame, so it does not alter
+the Host framebuffer or encoded stream.
+
 At startup, confirm that the Viewer reports:
 
 ```text

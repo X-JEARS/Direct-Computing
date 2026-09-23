@@ -2,9 +2,9 @@ use dc_auth::{PasswordVerifier, Permissions};
 use dc_common::{init_logging, log, DcError, LogLevel, Result};
 use dc_desktop::validate_input;
 use dc_desktop::{
-    changed_area, decode_region_payload, encode_region_update, packet_to_message,
-    packetize_h264_nal_message, packetize_video_message, DirtyRegionDetector,
-    H264NalDatagramReassembler, VideoDatagramReassembler,
+    changed_area, classify_video_datagram, decode_region_payload, encode_region_update,
+    packet_to_message, packetize_h264_nal_message, packetize_video_message, DirtyRegionDetector,
+    H264NalDatagramReassembler, VideoDatagramKind, VideoDatagramReassembler,
 };
 #[cfg(target_os = "windows")]
 use dc_media::{write_bmp, LastFrameSink};
@@ -213,6 +213,7 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<()> {
     let mut arguments = arguments.collect::<Vec<_>>();
     let mut profile = DEFAULT_RATE_PROFILE;
     let mut use_x264 = false;
+    let mut show_dirty_regions = false;
     while let Some(option) = arguments.first().map(String::as_str) {
         match option {
             "--ultra-low" => {
@@ -221,6 +222,10 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<()> {
             }
             "--x264" => {
                 use_x264 = true;
+                arguments.remove(0);
+            }
+            "--show-dirty-regions" => {
+                show_dirty_regions = true;
                 arguments.remove(0);
             }
             _ => break,
@@ -301,7 +306,13 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<()> {
             if arguments.next().is_some() {
                 return Err(DcError::InvalidInput(usage().into()));
             }
-            run_network_viewer(&address, &password, fingerprint.as_deref(), profile)
+            run_network_viewer(
+                &address,
+                &password,
+                fingerprint.as_deref(),
+                profile,
+                show_dirty_regions,
+            )
         }
         Some(argument) => Err(DcError::InvalidInput(format!(
             "unknown argument {argument}; {}",
@@ -330,7 +341,7 @@ where
 }
 
 const fn usage() -> &'static str {
-    "usage: direct-computing [--ultra-low] [--x264] [--host [addr] <password> | --connect <addr> <password> [cert-sha256] | --loopback [frame-count] | --window-test [duration-seconds] | --capture-test [frame-count] [display-index] [output.bmp] | --preview [display-index] [duration-seconds]]"
+    "usage: direct-computing [--ultra-low] [--x264] [--show-dirty-regions] [--host [addr] <password> | --connect <addr> <password> [cert-sha256] | --loopback [frame-count] | --window-test [duration-seconds] | --capture-test [frame-count] [display-index] [output.bmp] | --preview [display-index] [duration-seconds]]"
 }
 
 fn run_network_host(
@@ -1540,6 +1551,7 @@ fn run_network_viewer(
     password: &str,
     fingerprint: Option<&str>,
     profile: RateProfile,
+    show_dirty_regions: bool,
 ) -> Result<()> {
     let address = address.to_owned();
     let password = password.to_owned();
@@ -1636,6 +1648,7 @@ fn run_network_viewer(
             }
             let mut decoder = create_viewer_decoder()?;
             let mut sink = PreviewWindowSink::new("Direct Computing - Remote Desktop");
+            sink.set_dirty_region_debug(show_dirty_regions);
             sink.show_placeholder(640, 360)?;
             log(
                 LogLevel::Info,
@@ -1717,10 +1730,32 @@ fn run_network_viewer(
                                     ),
                                 );
                             }
-                            let reassembled = if host_h264_nal_datagrams {
-                                nal_reassembler.push(&datagram)
-                            } else {
-                                frame_reassembler.push(&datagram)
+                            let reassembled = match classify_video_datagram(&datagram) {
+                                Some(VideoDatagramKind::H264Nal) if host_h264_nal_datagrams => {
+                                    nal_reassembler.push(&datagram)
+                                }
+                                Some(VideoDatagramKind::Legacy) => {
+                                    frame_reassembler.push(&datagram)
+                                }
+                                Some(VideoDatagramKind::H264Nal) => {
+                                    log(
+                                        LogLevel::Warn,
+                                        "direct-computing::stream-viewer",
+                                        "dropping NAL datagram from a peer without NAL capability",
+                                    );
+                                    continue;
+                                }
+                                None => {
+                                    log(
+                                        LogLevel::Warn,
+                                        "direct-computing::stream-viewer",
+                                        &format!(
+                                            "dropping unknown video datagram envelope bytes={}",
+                                            datagram.len()
+                                        ),
+                                    );
+                                    continue;
+                                }
                             };
                             match reassembled {
                             Ok(Some(message)) => {
@@ -1762,10 +1797,9 @@ fn run_network_viewer(
                                     log(
                                         LogLevel::Warn,
                                         "direct-computing::stream-viewer",
-                                        &format!("video datagram rejected: {error}"),
+                                        &format!("dropping rejected video datagram: {error}"),
                                     );
-                                    let _ = video_tx.send(Err(error.to_string())).await;
-                                    break;
+                                    continue;
                                 }
                             }
                         }

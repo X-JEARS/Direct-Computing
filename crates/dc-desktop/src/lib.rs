@@ -293,7 +293,9 @@ pub use region::{
     changed_area, decode_region_payload, encode_region_update, DirtyRegionDetector,
     REGION_ENCODING_PACK_BITS, REGION_ENCODING_RAW,
 };
-pub use video_datagram::{packetize_h264_nal_message, packetize_video_message};
 pub use video_datagram::{
-    H264NalDatagramReassembler, VideoDatagramReassembler, VideoDatagramStats,
+    classify_video_datagram, packetize_h264_nal_message, packetize_video_message,
+};
+pub use video_datagram::{
+    H264NalDatagramReassembler, VideoDatagramKind, VideoDatagramReassembler, VideoDatagramStats,
 };

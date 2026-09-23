@@ -129,12 +129,27 @@ Run a 60-second live preview of the primary display with:
 cargo run -p direct-computing -- --preview 0 60
 ```
 
+To inspect incremental desktop updates, add `--show-dirty-regions` before `--connect` on the
+Viewer. Each received dirty region is outlined in bright green without modifying the retained
+desktop framebuffer or the pixels sent by the Host:
+
+```powershell
+.\direct-computing.exe --show-dirty-regions --connect <host>:22100 '<password>' '<cert-sha256>'
+```
+
+The overlay is disabled by default and is intended only for testing dirty-region detection and
+transport.
+
 Pass duration `0` to keep the preview open until the window is closed or Escape is pressed. The
 window title and console report FPS, skipped frames, throughput, and capture/encode/decode/display
 timings. OpenH264 rate-control skips are reported and do not terminate the preview.
 
 See [`docs/WINDOWS_CAPTURE_TESTING.md`](docs/WINDOWS_CAPTURE_TESTING.md) for prerequisites and the
 runtime test matrix.
+
+The stateful dirty-region, selective retransmission, framebuffer versioning, and recovery design is
+documented in
+[`docs/DESKTOP_INCREMENTAL_TRANSPORT_PLAN.md`](docs/DESKTOP_INCREMENTAL_TRANSPORT_PLAN.md).
 
 For the cross-platform Windows Host → macOS Viewer test procedure, see
 [`docs/WINDOWS_MAC_STREAMING_TESTING.md`](docs/WINDOWS_MAC_STREAMING_TESTING.md).
