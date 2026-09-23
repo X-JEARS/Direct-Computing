@@ -1382,12 +1382,29 @@ impl dc_media::VideoDecoder for MacViewerDecoder {
             match dc_media::VideoDecoder::decode(decoder, packet.clone()) {
                 Ok(frame) => return Ok(frame),
                 Err(error) => {
+                    // Inter frames can legitimately become undecodable after
+                    // loss on the QUIC DATAGRAM lane. Keep VideoToolbox alive
+                    // so the viewer can recover on the next keyframe instead
+                    // of permanently falling back to software after one gap.
+                    if !packet.is_keyframe() {
+                        return Err(error);
+                    }
                     log(
                         LogLevel::Warn,
                         "direct-computing::stream-viewer",
-                        &format!("VideoToolbox decode failed, switching to OpenH264: {error}"),
+                        &format!("VideoToolbox keyframe decode failed, trying OpenH264: {error}"),
                     );
-                    self.hardware = None;
+                    match dc_media::VideoDecoder::decode(&mut self.fallback, packet) {
+                        Ok(frame) => {
+                            self.hardware = None;
+                            return Ok(frame);
+                        }
+                        Err(fallback_error) => {
+                            return Err(DcError::Codec(format!(
+                                "VideoToolbox decode failed: {error}; OpenH264 fallback failed: {fallback_error}"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -1669,9 +1686,9 @@ fn run_network_viewer(
                     }
                 });
             }
-            let (video_tx, mut video_rx) = tokio::sync::watch::channel::<
-                Option<std::result::Result<ReceivedFrame, String>>,
-            >(None);
+            let (video_tx, mut video_rx) = tokio::sync::mpsc::channel::<
+                std::result::Result<ReceivedFrame, String>,
+            >(4);
             let datagrams_received = Arc::new(AtomicU64::new(0));
             let receiver_datagrams = datagrams_received.clone();
             let datagram_connection = connection.clone();
@@ -1679,6 +1696,9 @@ fn run_network_viewer(
                 let mut frame_reassembler = VideoDatagramReassembler::new();
                 let mut nal_reassembler = H264NalDatagramReassembler::new();
                 let mut completed_frames = 0_u64;
+                // The local path also supports negotiated per-NAL datagrams;
+                // the reassemblers below keep that capability while
+                // preserving the reliable keyframe queue.
                 loop {
                     match datagram_connection.receive_datagram().await {
                         Ok(datagram) => {
@@ -1715,30 +1735,42 @@ fn run_network_viewer(
                                         ),
                                     );
                                 }
-                                if video_tx
-                                    .send(Some(Ok(ReceivedFrame {
-                                        message: Arc::new(message),
-                                        received_at,
-                                    })))
-                                    .is_err()
-                                {
+                                let keyframe = matches!(
+                                    &message,
+                                    WireMessage::Video { keyframe: true, .. }
+                                );
+                                let update = Ok(ReceivedFrame {
+                                    message: Arc::new(message),
+                                    received_at,
+                                });
+                                if keyframe {
+                                    if video_tx.send(update).await.is_err() {
+                                        break;
+                                    }
+                                } else {
+                                    match video_tx.try_send(update) {
+                                        Ok(()) => {}
+                                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+                                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                                Ok(None) => continue,
+                                Err(error) => {
+                                    log(
+                                        LogLevel::Warn,
+                                        "direct-computing::stream-viewer",
+                                        &format!("video datagram rejected: {error}"),
+                                    );
+                                    let _ = video_tx.send(Err(error.to_string())).await;
                                     break;
                                 }
                             }
-                            Ok(None) => continue,
-                            Err(error) => {
-                                log(
-                                    LogLevel::Warn,
-                                    "direct-computing::stream-viewer",
-                                    &format!("video datagram rejected: {error}"),
-                                );
-                                let _ = video_tx.send(Some(Err(error.to_string())));
-                                break;
-                            }
-                            }
                         }
                         Err(error) => {
-                            let _ = video_tx.send(Some(Err(error.to_string())));
+                            let _ = video_tx.send(Err(error.to_string())).await;
                             break;
                         }
                     }
@@ -1761,6 +1793,7 @@ fn run_network_viewer(
                     frames_per_second: requested_fps,
                 })
                 .await?;
+            let mut waiting_for_keyframe = true;
             let mut packet_logged = false;
             let mut decoded_logged = false;
             let mut content_frame_logged = false;
@@ -1774,14 +1807,10 @@ fn run_network_viewer(
                 let update = match keyframe_rx.try_recv() {
                     Ok(update) => Some(update),
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                        match tokio::time::timeout(
-                            Duration::from_millis(16),
-                            video_rx.changed(),
-                        )
-                        .await
+                        match tokio::time::timeout(Duration::from_millis(16), video_rx.recv()).await
                         {
-                            Ok(Ok(())) => video_rx.borrow_and_update().clone(),
-                            Ok(Err(_)) => {
+                            Ok(Some(update)) => Some(update),
+                            Ok(None) => {
                                 return Err(DcError::Platform(
                                     "video datagram receiver closed".into(),
                                 ));
@@ -1819,10 +1848,13 @@ fn run_network_viewer(
                     last_frame_progress = Instant::now();
                     datagrams_at_last_frame = datagrams_received.load(Ordering::Relaxed);
                     let sequence = video_sequence(received.message.as_ref());
+                    let mut sequence_gap = false;
                     if let (Some(previous), Some(current)) = (last_sequence, sequence) {
                         if current <= previous {
                             continue;
                         }
+                        let gap = current.saturating_sub(previous.saturating_add(1));
+                        sequence_gap = gap > 0;
                     }
                     let message_is_keyframe = matches!(
                         received.message.as_ref(),
@@ -1900,11 +1932,42 @@ fn run_network_viewer(
                         );
                         packet_logged = true;
                     }
+                    if sequence_gap {
+                        waiting_for_keyframe = true;
+                    }
+                    if waiting_for_keyframe && !packet_is_keyframe {
+                        if last_keyframe_request
+                            .is_none_or(|time| time.elapsed() >= Duration::from_secs(1))
+                        {
+                            control
+                                .send(&WireMessage::KeyframeRequest {
+                                    last_sequence: sequence.unwrap_or_default(),
+                                })
+                                .await?;
+                            last_keyframe_request = Some(Instant::now());
+                            log(
+                                LogLevel::Debug,
+                                "direct-computing::stream-viewer",
+                                "waiting for a recovery keyframe; dropped dependent frame",
+                            );
+                        }
+                        continue;
+                    }
+                    if waiting_for_keyframe {
+                        // Reset VideoToolbox/OpenH264 before consuming the
+                        // recovery keyframe so no references from the damaged
+                        // GOP survive into the new decode chain.
+                        decoder = create_viewer_decoder()?;
+                    }
                     let frame = match decoder.decode(packet) {
-                        Ok(frame) => frame,
+                        Ok(frame) => {
+                            waiting_for_keyframe = false;
+                            frame
+                        }
                         Err(error) => {
+                            waiting_for_keyframe = true;
                             if last_keyframe_request
-                                .is_none_or(|time| time.elapsed() >= Duration::from_secs(2))
+                                .is_none_or(|time| time.elapsed() >= Duration::from_secs(1))
                             {
                                 control
                                     .send(&WireMessage::KeyframeRequest {
@@ -1983,7 +2046,7 @@ fn run_network_viewer(
                 if last_frame_progress.elapsed() >= Duration::from_secs(2)
                     && incomplete_datagrams
                     && last_keyframe_request
-                        .is_none_or(|time| time.elapsed() >= Duration::from_secs(2))
+                        .is_none_or(|time| time.elapsed() >= Duration::from_secs(1))
                 {
                     if incomplete_datagrams {
                         (requested_bitrate, requested_fps) = reduce_stream_rate(

@@ -95,6 +95,8 @@ Viewer 启动后会先创建占位窗口。正常收到并重组首帧时，应�
 
 ```text
 media protocol=hybrid-v2 host_hybrid_video=true video transport=hybrid-keyframe-stream+quic-datagram ...
+received video datagram index=1 bytes=...
+received first complete video frame after ... datagrams
 first encoded frame sequence=... keyframe=true ...
 first decoded frame sequence=... non_zero=... dimensions=...x...
 received video datagram index=1 bytes=...
@@ -273,10 +275,29 @@ cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<passwo
   capture and encoding. It resumes only after the Viewer has decoded, presented,
   and acknowledged that keyframe; ordinary frames therefore cannot accumulate
   behind a recovery anchor.
+- Video data uses QUIC DATAGRAM fragments. Missing or stale fragments may be
+  discarded; when a sequence gap or decode error is observed, the Viewer sends
+  a keyframe request and the Host resumes from a fresh IDR when supported.
+- The Viewer keeps recovery keyframes in a bounded decode queue while allowing
+  stale inter frames to be discarded. After a sequence gap it stops feeding
+  dependent frames to the decoder, requests a keyframe, and recreates the
+  VideoToolbox/OpenH264 decode chain before consuming that recovery frame.
+  A lost inter frame must not permanently switch the macOS Viewer away from
+  VideoToolbox.
+- A single lost fragment invalidates the whole encoded frame. For low-bandwidth or
+  lossy links, record the number of received fragments and completed frames; the
+  current DATAGRAM path repeats keyframe fragments once as a lightweight loss
+  mitigation, but it is not yet a reliable keyframe path. Reliable keyframe
+  delivery or FEC/fragment retransmission remains a planned improvement.
 - Do not treat `presented=0` as a rendering failure until the Viewer has logged
-  `received complete video frame`. If a complete frame is decoded but the window
+  `received first complete video frame`. If a complete frame is decoded but the window
   remains black, compare `non_zero` decoded bytes and then inspect pixel conversion
   and the minifb presentation backend.
+- On macOS, resize the Viewer and enter/leave native fullscreen. The Metal view
+  must remain inside the content layout below the title bar, and the video must
+  stay centered in that content area. Letterbox/pillarbox bars are not part of
+  the remote pointer surface: positions are mapped only within the displayed
+  video rectangle and clamped at its edges.
 - The stream remains active for at least 15 minutes without QUIC, decode, or application errors.
 - Moving the mouse and pressing/releasing keys in the macOS Viewer produces the expected input on
   Windows. Verify only on a disposable test desktop; remote input is intentionally enabled by the

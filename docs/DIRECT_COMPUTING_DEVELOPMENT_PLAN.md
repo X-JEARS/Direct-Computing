@@ -679,6 +679,10 @@ VideoToolbox 的完整能力矩阵和零拷贝渲染、HEVC/AV1 以及安装包�
 - [x] 将 MFT 自然产生的周期 IDR 与启动/显式恢复屏障分离：自然 IDR 继续可靠发送但不暂停采集、不等待 ACK；解决软件 MFT 拒绝关键帧间隔控制并约每四帧产生一次 IDR 时的频繁停顿；
 - [ ] 用新加入的逐项控制日志复测软件 Media Foundation MFT 在 64–96 Kbps 下的输出；历史测试中普通帧达到约 117–269 KB（103–237 个 Datagram 分片）。若该 MFT 明确拒绝必要的 CBR/VBV/QP 控制，优先评估 oneVPL/Quick Sync、NVENC 或 AMF 等具有显式码率控制的硬件 H.264 后端；OpenH264 不作为性能替代方案；
 - [x] 首个真实帧到达后按客户端可用屏幕空间重建窗口；服务端原始分辨率加窗口装饰高度能够容纳时按原始分辨率显示；
+- [x] 关键帧 Datagram 分片进行一次冗余发送，降低单个分片丢失导致首帧无法重组的概率
+- [x] Viewer 使用有界解码队列保留恢复关键帧、丢弃过期依赖帧；序号断档后等待新关键帧并重建解码器
+- [x] macOS Viewer 使用标题栏下方的内容布局呈现画面，鼠标只按实际视频矩形映射并忽略黑边
+- [ ] 关键帧可靠传输或 FEC/分片重传，适配高丢包和低带宽链路
 - [x] 普通帧分片上限与超限关键帧恢复，防止窄带链路出现数百 Datagram 的单帧洪泛
 - [ ] 完成 QUIC DATAGRAM 接收计数、分片丢失率和恢复时间的双机实测
 - [x] RTT/丢包/队列/编码耗时驱动的基础码率控制器
@@ -689,6 +693,10 @@ VideoToolbox 的完整能力矩阵和零拷贝渲染、HEVC/AV1 以及安装包�
 Windows Host → macOS Viewer 可以先作为跨平台集成测试：Windows 使用 DXGI 采集，macOS 使用
 通用 Viewer 窗口解码并回传输入。该测试不替代 Windows ↔ Windows 长时间基准；macOS Host
 原生屏幕采集仍属于后续跨平台阶段。
+
+2026-09-22 的 Windows Host → macOS Viewer 联调已确认新 QUIC DATAGRAM 路径能够持续接收并
+呈现数据，窗口缩放后的鼠标指向与 Host 一致；标题栏和宽高比产生的黑边不参与远端坐标映射。
+高丢包恢复时间、15 分钟以上稳定性和 1080p/30 P95 延迟仍需按专项测试清单记录。
 
 当前可通过 `direct-computing --host [addr] <password>` 启动 Host，通过
 `direct-computing --connect <addr> <password> [cert-sha256]` 启动 Viewer；首次连接会显示
