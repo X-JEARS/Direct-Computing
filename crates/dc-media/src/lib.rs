@@ -10,10 +10,13 @@ mod pipeline;
 mod raw;
 mod synthetic;
 
-pub use frame::{FrameLayout, FrameSize, PixelFormat, VideoFrame};
+pub use frame::{
+    CursorShape, CursorShapeKind, CursorUpdate, DamageRect, FrameLayout, FrameMetadata, FrameSize,
+    PixelFormat, VideoFrame,
+};
 #[cfg(feature = "openh264")]
 pub use h264::{OpenH264Decoder, OpenH264Encoder};
-pub use h264_nal::split_h264_nal_units;
+pub use h264_nal::{h264_access_unit_is_keyframe, split_h264_nal_units};
 pub use output::{write_bmp, LastFrameSink};
 pub use packet::{EncodedVideoPacket, VideoCodec};
 pub use pipeline::{

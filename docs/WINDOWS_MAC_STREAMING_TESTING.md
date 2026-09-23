@@ -154,24 +154,32 @@ cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<passwo
   into the shared BGRA frame model, so `zero_copy=false` is expected.
 - Initial and recovery keyframes use a dedicated reliable QUIC stream. Ordinary
   frames use QUIC DATAGRAM fragments and may be discarded when incomplete or stale.
-- A single lost Datagram fragment invalidates an ordinary frame. The Host limits
-  ordinary frames to 96 fragments; larger frames are dropped and converted into a
-  reliable keyframe recovery instead of flooding a narrow link.
-- The low-bandwidth target preserves the captured resolution and uses 16-bit
+  The Host waits for Datagram send-buffer capacity while sending the fragments
+  of one frame. Quinn's immediate-send API evicts older queued Datagram payloads
+  under pressure, which previously caused a large frame to discard its own
+  leading fragments.
+- In the legacy DCVD whole-frame compatibility path, a single lost Datagram
+  fragment invalidates an ordinary frame. The Host limits those ordinary frames
+  to 96 fragments; larger frames are dropped and converted into a reliable
+  keyframe recovery instead of flooding a narrow link. Peers that negotiate the
+  NAL Datagram mode packetize and reassemble each NAL independently instead.
+- The default balanced target preserves the captured resolution and uses true 16-bit
   RGB565-style color quantization before H.264 encoding. Pointer coordinates therefore
   remain in the original desktop coordinate system. When Datagram fragments
   continue arriving without a complete frame, the Viewer sends a rate hint that
-  steps down toward 96 Kbps / 4 FPS. The current low-bandwidth test profile starts at
-  96 Kbps / 4 FPS and can rise to 320 Kbps / 8 FPS after stable delivery. The Host also reduces the target immediately
-  when an inter frame exceeds the 96-fragment budget. A static desktop with no incoming Datagram
-  traffic is not treated as congestion.
-  The Viewer now starts at the profile floor (96 Kbps / 4 FPS for the normal
-  profile, 64 Kbps / 3 FPS for `--ultra-low`) and only raises the rate after a
+  steps down toward 384 Kbps / 6 FPS. The balanced profile starts at
+  1 Mbps / 12 FPS and can rise to 4 Mbps / 30 FPS after stable delivery. The Host also reduces the target immediately
+  when an inter frame exceeds the legacy DCVD 96-fragment budget. The negotiated
+  NAL Datagram path does not apply that whole-frame guard. A static desktop with
+  no incoming Datagram traffic is not treated as congestion.
+  The Viewer starts at the profile's initial target (1 Mbps / 12 FPS for the
+  balanced profile, 64 Kbps / 3 FPS for `--ultra-low`) and only raises the rate after a
   stable run of complete inter frames. On Windows, the first decoded frame
   recreates the placeholder window at native size when the remote dimensions
   plus window decoration fit the local primary display.
-  The low profile applies aggressive 3-bit-per-channel color quantization
-  before H.264 encoding; `--ultra-low` uses 2-bit-per-channel quantization.
+  The balanced profile uses RGB565 masks (5/6/5 bits), correcting the former
+  3-bit-per-channel implementation that was described as 16-bit but was
+  actually only 9-bit color. `--ultra-low` deliberately keeps 2 bits per channel.
   Spatial block averaging is intentionally disabled so text and small controls
   remain readable while the source dimensions are preserved.
   The Windows Host prefers a hardware Media Foundation H.264 MFT at every
@@ -181,20 +189,62 @@ cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<passwo
   different subsets. A software-only MF MFT remains preferred when it is
   available, because it is generally faster than the OpenH264 fallback in this
   project. OpenH264 is used only when Media Foundation cannot initialize or
-  configure an H.264 MFT. The fallback uses QP 42..51 at the 64 Kbps floor and
-  QP 36..51 for the other low-quality rates, together with bitrate-mode and
-  low-complexity settings.
+  configure an H.264 MFT, or when an active MFT fails at runtime. It must not be
+  selected merely because the available MFT is software-only. The fallback
+  uses QP 42..51 at the 64 Kbps floor and QP 36..51 for the other low-quality
+  rates, together with bitrate-mode and low-complexity settings.
+  Every MFT startup now logs `MFT codec controls` before and after media-type
+  negotiation. Inspect the `accepted` and `rejected` lists rather than assuming
+  that CBR was applied. The requested policy includes CBR, mean/max bitrate, a
+  one-second VBV (bytes, not bits), low-latency/real-time operation, frame dropping,
+  no B frames, the display-remoting scenario, a maximum QP, and a five-second keyframe
+  distance. Force-keyframe capability is reported separately and is used when
+  supported instead of rebuilding the encoder.
   To test an even lower-quality profile without changing the captured resolution,
   prepend `--ultra-low` to both commands. This profile starts at 64 Kbps / 3 FPS
-  and can rise to 160 Kbps / 5 FPS; omit the flag for the normal 96 Kbps / 4 FPS
-  low-bandwidth profile.
-- In the latest 96 Kbps test, the software-only Media Foundation MFT produced
+  and can rise to 160 Kbps / 5 FPS; omit the flag for the balanced profile.
+- In an earlier 96 Kbps test, the software-only Media Foundation MFT produced
   inter frames of roughly 117–269 KB (103–237 Datagram fragments). Those frames
   exceeded the 96-fragment guard, so the Host discarded them and requested a new
   reliable keyframe. Initial frame presentation and keyframe ACK timing are now
   acceptable, but this repeated oversized-inter-frame cycle remains the main
-  bandwidth/latency issue to solve. The run did not show connection loss or
-  decoder errors.
+  MFT rate-control issue to verify with the per-control log. The run did not
+  show connection loss or decoder errors.
+- A later 1440x900 / 96 Kbps run forced the Host onto OpenH264. It reduced the
+  initial keyframe to about 91 KB and avoided the Host's oversized-frame guard,
+  but encoding became the dominant latency: ordinary observations included
+  roughly 240–306 ms and pathological frames took about 1.69–1.91 seconds.
+  OpenH264 is therefore a functional compatibility path, not an acceptable
+  full-resolution interactive encoder on that machine. Do not trade away MFT
+  encoding throughput solely to obtain smaller packets.
+- A subsequent software-MFT run showed normal encode averages near 20–60 ms and
+  Viewer decode/present near 10–25 ms / 2–4 ms, while complete frames were still
+  separated by repeated two-second recoveries. Control input remained responsive.
+  This isolated the delay to Datagram self-eviction plus the policy that discarded
+  every complete packet after a sequence gap. Datagram submission is now paced,
+  and an isolated gap is passed to decoder concealment; recovery is requested only
+  after an actual decode failure or sustained lack of complete media.
+- The preferred next backend work, if a particular MFT cannot enforce its rate
+  controls, is a native hardware path with explicit VBV/QP control: Intel
+  oneVPL/Quick Sync, NVIDIA NVENC, or AMD AMF. An optional libx264/FFmpeg path
+  may provide strong software rate control, but its CPU cost, binary deployment,
+  and licensing must be evaluated before it can replace the system MFT. Until
+  one of those backends is implemented, dirty-region updates should carry small
+  desktop changes and MFT should carry full-frame changes.
+- New peers negotiate `hybrid-v4-h264-nal-regions`: ordinary H.264 access units
+  are parsed into NAL units and each NAL is independently fragmented and
+  reassembled. This removes the old whole-frame fragment guard from the new
+  path and prevents one incomplete old access unit from blocking a later one.
+  Decoder output is still picture-oriented; partial-frame display is not yet
+  claimed. OpenH264 fallback additionally constrains VCL slice NAL sizes inside
+  the encoder based on the negotiated Datagram MTU.
+- An experimental x264 Host can be built with `--features x264` and selected by
+  placing `--x264` before `--host`. It requires native libx264 headers and an
+  import library, discovered through `X264_INCLUDE_DIR` / `X264_LIB_DIR` or
+  pkg-config, and is excluded from normal builds. The native bridge explicitly applies and
+  logs VBV and `slice-max-size` controls; treat the backend as experimental
+  until the Host log and parsed NAL sizes confirm that the installed libx264
+  accepted them.
 - On Windows, a failed Media Foundation Viewer decoder probe is cached for the
   lifetime of the stream; the Viewer then stays on OpenH264 instead of retrying
   the unavailable MFT for every frame.
@@ -205,6 +255,11 @@ cargo run --release -p direct-computing -- --connect <windows-ip>:22100 '<passwo
 - Reliable keyframe requests are coalesced until the Viewer acknowledges that the
   current keyframe was decoded and presented. This prevents multiple large IDR frames
   from accumulating behind one another on a narrow reliable stream.
+- Natural periodic IDRs from the MFT also use the reliable media stream, but they do
+  not create an acknowledgement barrier or pause capture. Only startup, explicit
+  recovery, and encoder reconfiguration frames pause capture. This matters for the
+  tested software MFT, which rejected keyframe-distance control and emitted an IDR
+  roughly every four frames.
 - The Viewer records the receive timestamp after a QUIC message has arrived, rather
   than before waiting for the next message; this keeps `receive_to_present_avg` from
   including idle time between frames. The Host also drops encoded frames that became

@@ -48,6 +48,8 @@ impl Permissions {
             clipboard: false,
             ssh_compatibility: self.ssh_access,
             hybrid_video: false,
+            desktop_optimizations: false,
+            h264_nal_datagrams: false,
         }
     }
 }

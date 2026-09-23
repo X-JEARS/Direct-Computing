@@ -206,9 +206,11 @@ dependencies = [
 name = "dc-platform"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "dc-common",
  "dc-media",
  "dc-protocol",
+ "pkg-config",
  "windows",
 ]
 

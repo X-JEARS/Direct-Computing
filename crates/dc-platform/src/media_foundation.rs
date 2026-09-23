@@ -4,15 +4,15 @@
 //! application a vendor-neutral Windows encoder path while keeping the future
 //! D3D11 zero-copy and NVENC/AMF/QSV implementations behind the same trait.
 
-use dc_common::{DcError, Result};
+use dc_common::{log, DcError, LogLevel, Result};
 use dc_media::{
-    EncodeOutcome, EncodedVideoPacket, EncoderCapabilities, FrameLayout, PixelFormat, VideoCodec,
-    VideoEncoder, VideoFrame,
+    h264_access_unit_is_keyframe, EncodeOutcome, EncodedVideoPacket, EncoderCapabilities,
+    FrameLayout, PixelFormat, VideoCodec, VideoEncoder, VideoFrame,
 };
 use std::mem::ManuallyDrop;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use windows::core::{Interface, GUID};
+use windows::core::{Interface, GUID, PWSTR};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::{VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_UI4};
@@ -28,6 +28,7 @@ pub struct WindowsMediaFoundationH264Encoder {
     hardware_accelerated: bool,
     asynchronous: bool,
     events: Option<IMFMediaEventGenerator>,
+    supports_force_keyframe: bool,
 }
 
 impl WindowsMediaFoundationH264Encoder {
@@ -44,7 +45,7 @@ impl WindowsMediaFoundationH264Encoder {
         }
         ensure_media_foundation()?;
         let (transform, hardware_accelerated) = activate_encoder()?;
-        let asynchronous =
+        let (asynchronous, supports_force_keyframe) =
             configure_transform(&transform, width, height, bitrate, frames_per_second)?;
         let events = if asynchronous {
             Some(
@@ -66,6 +67,7 @@ impl WindowsMediaFoundationH264Encoder {
             hardware_accelerated,
             asynchronous,
             events,
+            supports_force_keyframe,
         })
     }
 
@@ -86,8 +88,19 @@ impl VideoEncoder for WindowsMediaFoundationH264Encoder {
             hardware_accelerated: self.hardware_accelerated,
             zero_copy_input: false,
             low_latency: true,
-            supports_force_keyframe: false,
+            supports_force_keyframe: self.supports_force_keyframe,
         }
+    }
+
+    fn force_keyframe(&mut self) -> Result<()> {
+        let codec_api = self.transform.cast::<ICodecAPI>().map_err(|_| {
+            DcError::Unsupported("Media Foundation encoder has no ICodecAPI".into())
+        })?;
+        set_codec_u32(&codec_api, &CODECAPI_AVEncVideoForceKeyFrame, 1).map_err(|error| {
+            DcError::Unsupported(format!(
+                "Media Foundation encoder rejected force-keyframe control: {error}"
+            ))
+        })
     }
 
     fn encode(&mut self, frame: VideoFrame) -> Result<EncodeOutcome> {
@@ -253,7 +266,7 @@ impl WindowsMediaFoundationH264Encoder {
         if data.is_empty() {
             return Ok(EncodeOutcome::Skipped);
         }
-        let keyframe = self.first_output;
+        let keyframe = self.first_output || h264_access_unit_is_keyframe(&data)?;
         self.first_output = false;
         let layout = FrameLayout::packed(frame.layout().size(), PixelFormat::Bgra32)?;
         Ok(EncodeOutcome::Packet(EncodedVideoPacket::new(
@@ -335,8 +348,32 @@ fn activate_encoder() -> Result<(IMFTransform, bool)> {
         DcError::Platform("Media Foundation returned an empty encoder activation".into())
     })?;
     unsafe { CoTaskMemFree(Some(activates.cast())) };
+    let friendly_name = activation_friendly_name(&activation)
+        .unwrap_or_else(|| "unknown Media Foundation encoder".into());
+    log(
+        LogLevel::Info,
+        "dc-platform::media-foundation",
+        &format!("selected MFT encoder name={friendly_name:?} hardware={hardware_accelerated}"),
+    );
     let transform = unsafe { activation.ActivateObject::<IMFTransform>() }.map_err(mf_error)?;
     Ok((transform, hardware_accelerated))
+}
+
+fn activation_friendly_name(activation: &IMFActivate) -> Option<String> {
+    let mut pointer = PWSTR::null();
+    let mut length = 0_u32;
+    if unsafe {
+        activation.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut pointer, &mut length)
+    }
+    .is_err()
+        || pointer.is_null()
+    {
+        return None;
+    }
+    let name =
+        unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(pointer.0, length as usize)) };
+    unsafe { CoTaskMemFree(Some(pointer.0.cast())) };
+    Some(name)
 }
 
 fn configure_transform(
@@ -345,7 +382,7 @@ fn configure_transform(
     height: u32,
     bitrate: u32,
     frames_per_second: u32,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let attributes = unsafe { transform.GetAttributes() }
         .map_err(|error| mf_stage_error("get Media Foundation transform attributes", error))?;
     let asynchronous = unsafe { attributes.GetUINT32(&MF_TRANSFORM_ASYNC) }
@@ -366,9 +403,11 @@ fn configure_transform(
     // IMFTransform exposes codec-specific controls through ICodecAPI.  These
     // controls are optional across GPU vendors, so apply them best-effort and
     // keep the media-type bitrate as the portable fallback.
-    configure_codec_api(transform, bitrate);
+    let force_keyframe_before_types =
+        configure_codec_api(transform, bitrate, frames_per_second, "before-media-types");
     let input = input_media_type(width, height, frames_per_second)?;
     let output = output_media_type(width, height, bitrate, frames_per_second)?;
+    let force_keyframe_after_types;
     unsafe {
         // Some hardware encoders derive their accepted input types from the
         // selected H.264 profile. Configure the output before its dependent
@@ -382,7 +421,8 @@ fn configure_transform(
         // A number of vendor MFTs only expose ICodecAPI after their media
         // types have been selected. Repeat the best-effort controls here so
         // those encoders receive the same low-bandwidth policy.
-        configure_codec_api(transform, bitrate);
+        force_keyframe_after_types =
+            configure_codec_api(transform, bitrate, frames_per_second, "after-media-types");
         transform
             .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)
             .map_err(|error| mf_stage_error("begin Media Foundation streaming", error))?;
@@ -390,28 +430,86 @@ fn configure_transform(
             .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)
             .map_err(|error| mf_stage_error("start Media Foundation stream", error))?;
     }
-    Ok(asynchronous)
+    Ok((
+        asynchronous,
+        force_keyframe_before_types || force_keyframe_after_types,
+    ))
 }
 
-fn configure_codec_api(transform: &IMFTransform, bitrate: u32) {
+fn configure_codec_api(
+    transform: &IMFTransform,
+    bitrate: u32,
+    frames_per_second: u32,
+    phase: &str,
+) -> bool {
     let Ok(codec_api) = transform.cast::<ICodecAPI>() else {
-        return;
+        log(
+            LogLevel::Warn,
+            "dc-platform::media-foundation",
+            &format!("MFT has no ICodecAPI phase={phase}"),
+        );
+        return false;
     };
-    // CBR and a matching mean/max bitrate keep hardware encoders from
-    // producing an oversized IDR burst when a low-bandwidth profile is active.
-    let _ = set_codec_u32(
-        &codec_api,
-        &CODECAPI_AVEncCommonRateControlMode,
-        eAVEncCommonRateControlMode_CBR.0 as u32,
+    // Keep the MFT on a short-delay, bounded VBV policy. These properties are
+    // optional per encoder, so record every accepted/rejected control instead
+    // of silently assuming that a successful MFT activation means CBR works.
+    let controls = [
+        (
+            "rate-control=cbr",
+            &CODECAPI_AVEncCommonRateControlMode,
+            eAVEncCommonRateControlMode_CBR.0 as u32,
+        ),
+        ("mean-bitrate", &CODECAPI_AVEncCommonMeanBitRate, bitrate),
+        ("max-bitrate", &CODECAPI_AVEncCommonMaxBitRate, bitrate),
+        // One second of coded data, expressed in bytes. Encoders that honor
+        // this VBV setting can
+        // no longer amortize a very large desktop frame over an unbounded
+        // interval while claiming to meet the average bitrate.
+        (
+            "buffer-size",
+            &CODECAPI_AVEncCommonBufferSize,
+            bitrate.div_ceil(8),
+        ),
+        ("low-latency", &CODECAPI_AVEncCommonLowLatency, 1),
+        ("real-time", &CODECAPI_AVEncCommonRealTime, 1),
+        ("allow-frame-drops", &CODECAPI_AVEncCommonAllowFrameDrops, 1),
+        ("b-frames", &CODECAPI_AVEncMPVDefaultBPictureCount, 0),
+        (
+            "display-remoting",
+            &CODECAPI_AVScenarioInfo,
+            eAVScenarioInfo_DisplayRemoting.0 as u32,
+        ),
+        ("maximum-qp", &CODECAPI_AVEncVideoMaxQP, 51),
+        (
+            "keyframe-distance",
+            &CODECAPI_AVEncVideoMaxKeyframeDistance,
+            frames_per_second.saturating_mul(5),
+        ),
+    ];
+    let mut accepted = Vec::new();
+    let mut rejected = Vec::new();
+    for (name, key, value) in controls {
+        match set_codec_u32(&codec_api, key, value) {
+            Ok(()) => accepted.push(format!("{name}:{value}")),
+            Err(error) => rejected.push(format!("{name}:{}", error.code())),
+        }
+    }
+    let supports_force_keyframe =
+        unsafe { codec_api.IsSupported(&CODECAPI_AVEncVideoForceKeyFrame) }.is_ok();
+    log(
+        LogLevel::Info,
+        "dc-platform::media-foundation",
+        &format!(
+            "MFT codec controls phase={phase} accepted=[{}] rejected=[{}] force_keyframe={supports_force_keyframe}",
+            accepted.join(","),
+            rejected.join(",")
+        ),
     );
-    let _ = set_codec_u32(&codec_api, &CODECAPI_AVEncCommonMeanBitRate, bitrate);
-    let _ = set_codec_u32(&codec_api, &CODECAPI_AVEncCommonMaxBitRate, bitrate);
-    let _ = set_codec_u32(&codec_api, &CODECAPI_AVEncCommonLowLatency, 1);
-    let _ = set_codec_u32(&codec_api, &CODECAPI_AVEncCommonRealTime, 1);
+    supports_force_keyframe
 }
 
 fn set_codec_u32(codec_api: &ICodecAPI, key: &GUID, value: u32) -> windows::core::Result<()> {
-    let mut variant = VARIANT {
+    let variant = VARIANT {
         Anonymous: VARIANT_0 {
             Anonymous: ManuallyDrop::new(VARIANT_0_0 {
                 vt: VT_UI4,
@@ -422,7 +520,7 @@ fn set_codec_u32(codec_api: &ICodecAPI, key: &GUID, value: u32) -> windows::core
             }),
         },
     };
-    unsafe { codec_api.SetValue(key, &mut variant) }
+    unsafe { codec_api.SetValue(key, &variant) }
 }
 
 fn video_media_type(

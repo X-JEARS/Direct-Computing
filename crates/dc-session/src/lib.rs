@@ -47,10 +47,11 @@ pub async fn authenticate_server(
         return Err(DcError::InvalidInput("authentication failed".into()));
     }
     let mut advertised_permissions = permissions.to_capabilities();
-    // The authenticated envelope predates explicit media negotiation. Reuse
-    // the reserved high capability bit so new Viewers can discover the Host
-    // media lane while old Viewers continue to decode the byte unchanged.
+    // Mirror transport features in the authenticated response so the Viewer
+    // can select only media lanes implemented by both peers.
     advertised_permissions.hybrid_video = capabilities.hybrid_video;
+    advertised_permissions.desktop_optimizations = capabilities.desktop_optimizations;
+    advertised_permissions.h264_nal_datagrams = capabilities.h264_nal_datagrams;
     stream
         .send(&WireMessage::Authenticated {
             permissions: advertised_permissions,

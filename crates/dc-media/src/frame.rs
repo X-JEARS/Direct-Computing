@@ -2,6 +2,48 @@ use dc_common::{DcError, Result};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CursorShapeKind {
+    Monochrome,
+    Color,
+    MaskedColor,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CursorShape {
+    pub kind: CursorShapeKind,
+    pub width: u32,
+    pub height: u32,
+    pub hotspot_x: u32,
+    pub hotspot_y: u32,
+    pub pitch: u32,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CursorUpdate {
+    pub visible: bool,
+    pub x: i32,
+    pub y: i32,
+    pub shape: Option<CursorShape>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FrameMetadata {
+    /// `Some` means the source supplied authoritative damage metadata. An
+    /// empty vector therefore means a cursor-only or unchanged desktop frame.
+    pub damage: Option<Vec<DamageRect>>,
+    pub cursor: Option<CursorUpdate>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PixelFormat {
     Rgb24,
     Bgra32,
@@ -110,6 +152,7 @@ pub struct VideoFrame {
     timestamp: Duration,
     layout: FrameLayout,
     data: Vec<u8>,
+    metadata: FrameMetadata,
 }
 
 impl VideoFrame {
@@ -131,7 +174,29 @@ impl VideoFrame {
             timestamp,
             layout,
             data,
+            metadata: FrameMetadata::default(),
         })
+    }
+
+    pub fn with_metadata(mut self, metadata: FrameMetadata) -> Result<Self> {
+        if let Some(rects) = &metadata.damage {
+            let size = self.layout.size();
+            for rect in rects {
+                let right = rect.x.checked_add(rect.width);
+                let bottom = rect.y.checked_add(rect.height);
+                if rect.width == 0
+                    || rect.height == 0
+                    || right.is_none_or(|value| value > size.width())
+                    || bottom.is_none_or(|value| value > size.height())
+                {
+                    return Err(DcError::InvalidInput(
+                        "damage rectangle is outside the frame".into(),
+                    ));
+                }
+            }
+        }
+        self.metadata = metadata;
+        Ok(self)
     }
 
     pub const fn sequence(&self) -> u64 {
@@ -148,6 +213,10 @@ impl VideoFrame {
 
     pub fn data(&self) -> &[u8] {
         &self.data
+    }
+
+    pub fn metadata(&self) -> &FrameMetadata {
+        &self.metadata
     }
 
     pub fn into_data(self) -> Vec<u8> {

@@ -49,6 +49,56 @@ travel over the authenticated control stream and are injected with Windows `Send
 connections expose a SHA-256 certificate fingerprint and later connections can pin it with the
 optional argument; `dc-transport` also provides a confirmed, persistent TOFU pin store.
 
+Remote input uses stable physical-key identifiers and Windows Set-1 scan-code injection, including
+distinct left/right modifiers, navigation keys, function keys, and numeric-keypad keys. Vertical
+and horizontal wheel motion is transported at high resolution, and held inputs are released if the
+control session closes unexpectedly.
+
+On Windows, negotiated desktop optimization reads DXGI dirty/move rectangles, sends small changes
+as bounded PackBits-compressed BGRA region updates, and transports the DXGI pointer separately for
+Viewer-side composition. Cursor-only frames bypass H.264, and an unchanged desktop is reduced to a
+five-second full-frame refresh interval. Larger or incompressible changes automatically fall back
+to the normal H.264 path; sequence gaps request a reliable recovery keyframe.
+
+Windows Host encoder preference is hardware Media Foundation H.264, then software Media
+Foundation H.264. OpenH264 is retained only as a compatibility fallback when Media Foundation
+cannot supply a usable encoder; it is not the preferred full-resolution interactive path because
+measured software encode latency can reach hundreds of milliseconds or more. MFT startup logs show
+which CBR/VBV/QP and low-latency controls the selected transform actually accepted.
+
+Peers from this revision negotiate H.264 NAL Datagram transport. The Host parses each encoded
+access unit into SPS/PPS/SEI/slice NAL units, packetizes each NAL independently, and the Viewer
+reassembles completed NAL units without requiring one monolithic frame-fragment chain. A missing
+NAL expires only its access unit and does not block a later frame. The current decoder adapters
+still present complete pictures, so this is packet-level slice pipelining rather than partial-frame
+display. The unit envelope carries an explicit codec identifier and picture/unit numbering so the
+same framing can be extended with H.265 NAL and AV1 OBU packetizers without redesigning QUIC lanes.
+
+An experimental libx264 Host backend is available behind the `x264` Cargo feature. It uses the
+`veryfast` preset with zero-latency/fast-decode tuning, no delayed B-frame/lookahead queue, Annex-B
+output, and a five-second GOP. It is opt-in because libx264 is a native GPL/commercial component:
+
+```powershell
+# Install libx264 headers/import library for the active MSVC target first. Set
+# X264_INCLUDE_DIR and X264_LIB_DIR, or make x264 discoverable through pkg-config, then:
+cargo build -p direct-computing --features x264
+target\debug\direct-computing.exe --x264 --host 0.0.0.0:22100 '<password>'
+```
+
+The optional platform bridge configures `vbv-maxrate`, a half-second `vbv-bufsize`,
+`slice-max-size`, `bframes=0`, `rc-lookahead=0`, `sync-lookahead=0`, repeated headers, and Annex-B
+output through libx264's official API. A normal build does not require libx264. The backend remains
+experimental until those settings are verified on the Windows test machines. The NAL-oriented
+transport is codec-adapter infrastructure and does not pretend that an arbitrary single large
+x264/MFT slice has become independently decodable merely because it was fragmented.
+
+The default desktop profile is balanced for interaction: it starts at 1 Mbps / 12 FPS, uses true
+RGB565 pre-quantization, can fall to 384 Kbps / 6 FPS under pressure, and can rise to 4 Mbps /
+30 FPS after stable delivery. `--ultra-low` remains available for deliberately constrained links.
+Video Datagram fragments wait for transport buffer space so a frame cannot evict its own earlier
+fragments; the bounded one-frame producer queue still drops stale newer work instead of building
+display latency.
+
 Stage 3 now includes bounded file manifests, fixed-size chunks, SHA-256 checksums, resume-offset
 validation, safe destination paths, `FileOffer`/`FileChunk`/`FileAck` protocol messages, and a
 dedicated QUIC file-stream sender/receiver with temporary-file atomic delivery. The Host/Viewer

@@ -33,6 +33,10 @@ pub use media_foundation::WindowsMediaFoundationH264Encoder;
 mod media_foundation_decoder;
 #[cfg(target_os = "windows")]
 pub use media_foundation_decoder::WindowsMediaFoundationH264Decoder;
+#[cfg(all(target_os = "windows", feature = "x264"))]
+mod x264;
+#[cfg(all(target_os = "windows", feature = "x264"))]
+pub use x264::X264Encoder;
 
 /// Sink for authenticated remote input events.
 pub trait InputInjector {

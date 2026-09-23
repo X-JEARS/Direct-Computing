@@ -32,6 +32,17 @@ pub fn split_h264_nal_units(bytes: &[u8]) -> Result<Vec<&[u8]>> {
         .collect())
 }
 
+/// Return whether an H.264 access unit contains an IDR picture.
+///
+/// Encoders are allowed to insert keyframes independently of an application
+/// request. Inspecting the bitstream is therefore more reliable than assuming
+/// that only the first output packet is independently decodable.
+pub fn h264_access_unit_is_keyframe(bytes: &[u8]) -> Result<bool> {
+    Ok(split_h264_nal_units(bytes)?
+        .into_iter()
+        .any(|nal| nal.first().is_some_and(|header| header & 0x1f == 5)))
+}
+
 fn split_avcc(bytes: &[u8]) -> Result<Vec<&[u8]>> {
     let mut output = Vec::new();
     let mut offset = 0;
@@ -80,5 +91,12 @@ mod tests {
     #[test]
     fn rejects_truncated_avcc() {
         assert!(split_h264_nal_units(&[0, 0, 0, 4, 1]).is_err());
+    }
+
+    #[test]
+    fn detects_idr_in_annex_b_and_avcc_access_units() {
+        assert!(h264_access_unit_is_keyframe(&[0, 0, 1, 0x65, 1]).unwrap());
+        assert!(h264_access_unit_is_keyframe(&[0, 0, 0, 2, 0x65, 1]).unwrap());
+        assert!(!h264_access_unit_is_keyframe(&[0, 0, 1, 0x41, 1]).unwrap());
     }
 }

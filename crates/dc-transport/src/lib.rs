@@ -173,6 +173,14 @@ impl QuicConnection {
             .send_datagram(data)
             .map_err(|error| DcError::Platform(format!("send QUIC datagram: {error}")))
     }
+    /// Send an unreliable Datagram without evicting older queued Datagram
+    /// fragments when the transport buffer is temporarily full.
+    pub async fn send_datagram_wait(&self, data: Bytes) -> Result<()> {
+        self.connection
+            .send_datagram_wait(data)
+            .await
+            .map_err(|error| DcError::Platform(format!("send QUIC datagram: {error}")))
+    }
     /// Receive an unreliable, unordered application datagram.
     pub async fn receive_datagram(&self) -> Result<Bytes> {
         self.connection

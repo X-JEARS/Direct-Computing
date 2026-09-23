@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Platform adapters for Direct Computing"
+build = "build.rs"
+
+[features]
+default = []
+x264 = []
 
 [dependencies]
 dc-common = { path = "../dc-common" }
@@ -26,6 +31,10 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # VideoToolbox/CoreMedia/CoreVideo are linked directly from the macOS SDK; no

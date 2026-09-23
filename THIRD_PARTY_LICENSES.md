@@ -26,7 +26,7 @@ crate's source distribution.
 | safe_arch | 1.2.0 | Zlib OR Apache-2.0 OR MIT |
 | same-file | 1.0.6 | Unlicense OR MIT |
 | shlex | 2.0.1 | MIT OR Apache-2.0 |
-| syn | 2.0.119 | MIT OR Apache-2.0 |
+| syn | 2.0.106 | MIT OR Apache-2.0 |
 | unicode-ident | 1.0.26 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | walkdir | 2.5.0 | Unlicense OR MIT |
 | wide | 1.7.1 | Zlib OR Apache-2.0 OR MIT |
@@ -54,3 +54,10 @@ licensing requirements in some jurisdictions. Before distributing binaries, the 
 an explicit codec-distribution decision and complete a legal review. Cisco's separately distributed
 prebuilt binaries have their own patent-license terms; this project does not currently download or
 redistribute those binaries.
+
+## Optional libx264 note
+
+The optional native libx264 library is offered under GPLv2 or a separate commercial license.
+Enabling the `x264` Cargo feature does not download or redistribute libx264. Anyone shipping a
+binary with this feature must provide the native library, comply with the selected libx264 license,
+and separately review H.264 patent terms.

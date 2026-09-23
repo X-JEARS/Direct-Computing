@@ -301,7 +301,7 @@ QUIC/TLS 1.3
 Windows Desktop Duplication 在桌面没有变化时可能持续超时。当前实现已经覆盖：
 
 - Viewer 在首个解码帧到达前创建占位窗口；
-- Viewer 在 2 秒没有完整帧、检测到序号间隔或解码失败时发送 `KeyframeRequest`；
+- Viewer 在 2 秒没有完整帧或解码失败时发送 `KeyframeRequest`；单次序号间隔交给解码器纠错，不再直接触发恢复风暴；
 - Host 对支持强制 IDR 的编码器直接请求关键帧；
 - 不支持运行时强制 IDR 的编码器通过重建编码器重置 GOP；
 - Desktop Duplication 超时时使用最近一帧生成恢复帧，并使用递增时间戳，避免编码器将其当作重复帧跳过；
@@ -310,15 +310,16 @@ Windows Desktop Duplication 在桌面没有变化时可能持续超时。当前�
 当前仍需完成的低带宽可靠性工作：
 
 - [x] 关键帧使用可靠 QUIC Stream，避免任一 Datagram 分片丢失导致解码锚点不可用；
-- [x] 低带宽保持原始分辨率，采用 RGB565 风格 16-bit 色深量化；默认从 96 Kbps / 4 FPS 起步，稳定后逐级升至 320 Kbps / 8 FPS；另支持 `--ultra-low`，从 64 Kbps / 3 FPS 起步并逐级升至 160 Kbps / 5 FPS；
+- [x] 默认平衡档保持原始分辨率并采用真实 RGB565（5/6/5-bit）色深量化，从 1 Mbps / 12 FPS 起步，可在 384 Kbps / 6 FPS 至 4 Mbps / 30 FPS 间自适应；另支持 `--ultra-low`，从 64 Kbps / 3 FPS 起步并逐级升至 160 Kbps / 5 FPS；
 - [x] H.264 编码路径确认使用 4:2:0：Media Foundation 输入为 NV12，OpenH264 转换为内部 YUV 4:2:0；
-- [x] 普通帧最多使用 96 个 Datagram 分片；超限帧丢弃并触发可靠关键帧恢复，避免分片洪泛；窄带恢复期间会优先丢弃过期编码帧；
+- [x] 旧版 DCVD 整帧 Datagram 兼容路径中，普通帧最多使用 96 个分片；超限帧丢弃并触发可靠关键帧恢复，避免分片洪泛；协商后的 NAL/slice 路径改为按 NAL 独立编号、分片和重组，不再套用整帧 96 分片上限；窄带恢复期间会优先丢弃过期编码帧；
 - [x] 可靠关键帧增加 Viewer 确认并合并重复恢复请求，避免窄带链路形成 IDR 排队风暴；
 - [x] QUIC 保持 2 秒 keepalive，并将弱网空闲超时从 10 秒扩展至 60 秒；
 - [x] Viewer 关闭窗口或发送 Close 后，Host 停止采集和编码线程；
 - [x] 媒体能力协商与旧版本兼容回退，避免新 Host/旧 Viewer 静默黑屏；
 - [ ] 根据稳定期吞吐和画面复杂度逐级恢复码率，并支持分辨率自适应；
-- [ ] 在 Windows Desktop Duplication 中接入 dirty rect 元数据，并评估按区域编码/合并的收益；
+- [x] 在 Windows Desktop Duplication 中接入 dirty/move rect 元数据，小区域使用有界 PackBits 区域更新并在大区域自动回退 H.264；
+- [x] 分离 DXGI 光标形状/位置并由 Viewer 合成；光标活动不触发视频编码，静止桌面降至每 5 秒一次完整刷新；
 - [ ] 为普通帧评估 FEC、选择性分片重传或编码器帧内刷新；
 - [ ] 增加受控丢包、限速和高延迟网络测试，记录完整帧率、恢复时间和输入延迟。
 
@@ -621,7 +622,7 @@ Wayland 放在 X11 之后实现。
 
 - [x] 将 Host 的采集、编码移出异步运行时线程
 - [x] 使用有界有序视频队列和背压，避免 H.264 参考帧被覆盖丢弃
-- [x] 合并同一 UI tick 内的鼠标移动事件，按键事件保持顺序
+- [x] 合并同一 UI tick 内的鼠标移动事件，按键、横向/纵向滚轮事件保持顺序
 - [x] 记录 capture/encode/send/receive/decode/present 的阶段耗时和接收至显示延迟
 - [x] 接入通用 Windows Media Foundation H.264 MFT 后端（优先硬件、软件回退）
 - [x] Windows Viewer 接入 Media Foundation H.264 解码（优先硬件、OpenH264 回退）
@@ -661,18 +662,27 @@ VideoToolbox 的完整能力矩阵和零拷贝渲染、HEVC/AV1 以及安装包�
 - [x] 不支持强制 IDR 的编码器通过重建编码器恢复 GOP；静止桌面使用最近帧生成递增时间戳的恢复帧
 - [x] Viewer 在无完整帧、序号间隔或解码失败时自动请求关键帧
 - [x] 首帧和恢复关键帧使用可靠 QUIC Stream；普通帧保留 QUIC DATAGRAM 低延迟路径
-- [x] 低带宽保持原始分辨率并采用 16-bit 色深量化，默认从 96 Kbps / 4 FPS 起步并可升至 320 Kbps / 8 FPS；`--ultra-low` 从 64 Kbps / 3 FPS 起步并可升至 160 Kbps / 5 FPS
-- [x] Viewer 默认从当前 profile 的最低码率/帧率启动，连续稳定接收普通帧后每 5 秒逐级升档，弱网时仍立即降档；
-- [x] 低码率档使用更激进的 3-bit 通道量化，`--ultra-low` 使用 2-bit 通道量化；保留每像素空间位置和文字边缘，不改变桌面空间分辨率；
+- [x] 默认平衡档保持原始分辨率并采用真实 RGB565 色深量化，从 1 Mbps / 12 FPS 起步，在 384 Kbps / 6 FPS 至 4 Mbps / 30 FPS 间自适应；`--ultra-low` 从 64 Kbps / 3 FPS 起步并可升至 160 Kbps / 5 FPS；
+- [x] Viewer 从当前 profile 的初始码率/帧率启动，连续稳定接收普通帧后每 5 秒逐级升档，弱网时立即降档；
+- [x] 修正默认档误标为 RGB565、实际仅为 3/3/3-bit 的颜色掩码，改为 5/6/5-bit；`--ultra-low` 保留 2-bit 通道量化；
 - [x] Windows Host 按硬件 Media Foundation H.264 MFT、软件 Media Foundation H.264 MFT、OpenH264 的顺序选择编码器；通过通用 `ICodecAPI` 尽力启用 CBR、平均/最大码率、实时和低延迟控制；只有 Media Foundation 无法初始化或配置时才回退 OpenH264，软件回退使用低复杂度、码率控制和高 QP（普通低档 36..51、64 Kbps 极低档 42..51）；
+- [x] 将 OpenH264 明确限定为兼容性兜底：1440x900 / 96 Kbps 实测常见编码耗时约 240–306 ms，极端帧约 1.69–1.91 s；不能因 MFT 为软件实现就切换到 OpenH264；
+- [x] MFT 启动时逐项记录 `ICodecAPI` 控制是否被接受；补充 CBR、平均/最大码率、一秒 VBV、QP 上下限、禁用 B 帧、允许丢帧、桌面远程场景和关键帧间隔，并在支持时直接请求 IDR 而非重建编码器；
 - [x] 将采集序号与媒体传输序号分离，仅对实际编码输出包分配连续媒体序号，避免编码器主动跳帧被 Viewer 误判为网络丢帧；
 - [x] 混合协议发送可靠关键帧时暂停新的采集和编码，直到 Viewer 完整解码、呈现并确认关键帧，再恢复最新桌面状态；
-- [ ] 处理软件 Media Foundation MFT 在 64–96 Kbps 下产生超大普通帧的问题：测试中普通帧达到约 117–269 KB（103–237 个 Datagram 分片），需要补充 MFT 码率/质量控制验证或专用的普通帧恢复策略，避免每个普通帧都触发可靠关键帧；
+- [x] Datagram 分片发送改为等待 Quinn 缓冲区空间，避免同一帧后续分片驱逐前置分片；重组超时按最后收到分片计算；Viewer 不再因单次媒体序号缺口丢弃已经完整到达的帧；
+- [x] 增加能力协商的 H.264 NAL/slice Datagram 模式：按 NAL 独立编号、分片、乱序重组和超时淘汰，丢失旧 access unit 不阻塞后续帧；保留旧 DCVD 整帧分片用于兼容旧 peer；
+- [x] OpenH264 兼容性兜底启用编码器内部 `max_slice_len`，其值由协商的 QUIC Datagram MTU 扣除协议余量后得出；测试验证 VCL NAL 被切为多个受限 slice；
+- [x] 增加 opt-in `x264` 软件后端与 `--x264` Host 选择项，通过本地 C 适配层调用 libx264 官方 API，配置 veryfast/zerolatency/fastdecode、`vbv-maxrate`、半秒 `vbv-bufsize`、`slice-max-size`、无 B 帧/无 lookahead；默认构建不链接 libx264；
+- [ ] 在 Windows 构建机安装/打包原生 libx264 后，完成 1440x900 双机质量、CPU、最大 NAL 与恢复时间对比；
+- [ ] 将 Viewer 解码接口扩展为增量 NAL 输入；当前传输层收到完整 NAL 后立即完成该单元重组，但 MFT/OpenH264 适配器仍等完整 access unit 才输出画面；
+- [x] 将 MFT 自然产生的周期 IDR 与启动/显式恢复屏障分离：自然 IDR 继续可靠发送但不暂停采集、不等待 ACK；解决软件 MFT 拒绝关键帧间隔控制并约每四帧产生一次 IDR 时的频繁停顿；
+- [ ] 用新加入的逐项控制日志复测软件 Media Foundation MFT 在 64–96 Kbps 下的输出；历史测试中普通帧达到约 117–269 KB（103–237 个 Datagram 分片）。若该 MFT 明确拒绝必要的 CBR/VBV/QP 控制，优先评估 oneVPL/Quick Sync、NVENC 或 AMF 等具有显式码率控制的硬件 H.264 后端；OpenH264 不作为性能替代方案；
 - [x] 首个真实帧到达后按客户端可用屏幕空间重建窗口；服务端原始分辨率加窗口装饰高度能够容纳时按原始分辨率显示；
 - [x] 普通帧分片上限与超限关键帧恢复，防止窄带链路出现数百 Datagram 的单帧洪泛
 - [ ] 完成 QUIC DATAGRAM 接收计数、分片丢失率和恢复时间的双机实测
 - [x] RTT/丢包/队列/编码耗时驱动的基础码率控制器
-- [x] Windows SendInput 鼠标键盘注入和 GUI 事件采集
+- [x] Windows SendInput 鼠标键盘注入和 GUI 事件采集；键盘使用稳定物理键码映射到 Set-1 扫描码，区分左右修饰键、导航键和小键盘，并在断线时释放按住状态
 - [x] 证书 SHA-256 指纹固定、TOFU pin store 与首次连接指纹提示
 - [ ] 真机 Windows ↔ Windows 长时间串流基准
 

@@ -71,6 +71,50 @@ impl OpenH264Encoder {
             Some(QpRange::new(minimum_qp.min(51), 51)),
         )
     }
+
+    /// Create the software fallback with a hard maximum NAL/slice size.
+    ///
+    /// OpenH264 applies this limit inside the encoder, unlike an application
+    /// level UDP fragment cap which can only reject an already encoded frame.
+    /// Keeping the limit slightly below the negotiated datagram payload leaves
+    /// room for the media and datagram headers.
+    pub fn new_network(
+        target_bitrate: u32,
+        frames_per_second: f32,
+        minimum_qp: u8,
+        max_slice_len: u32,
+    ) -> Result<Self> {
+        if max_slice_len < 256 {
+            return Err(DcError::InvalidInput(
+                "H.264 maximum slice length must be at least 256 bytes".into(),
+            ));
+        }
+        if target_bitrate == 0 {
+            return Err(DcError::InvalidInput(
+                "H.264 target bitrate must be non-zero".into(),
+            ));
+        }
+        if !frames_per_second.is_finite() || frames_per_second <= 0.0 {
+            return Err(DcError::InvalidInput(
+                "H.264 frame rate must be finite and greater than zero".into(),
+            ));
+        }
+        let qp_range = QpRange::new(minimum_qp.min(51), 51);
+        let config = EncoderConfig::new()
+            .bitrate(BitRate::from_bps(target_bitrate))
+            .max_frame_rate(FrameRate::from_hz(frames_per_second))
+            .usage_type(UsageType::ScreenContentRealTime)
+            .rate_control_mode(RateControlMode::Bitrate)
+            .complexity(Complexity::Low)
+            .skip_frames(true)
+            .adaptive_quantization(false)
+            .background_detection(false)
+            .qp(qp_range)
+            .max_slice_len(max_slice_len);
+        let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
+            .map_err(|error| DcError::Codec(error.to_string()))?;
+        Ok(Self { encoder })
+    }
 }
 
 impl VideoEncoder for OpenH264Encoder {
@@ -269,5 +313,29 @@ mod tests {
         assert!(!capabilities.hardware_accelerated);
         assert!(!capabilities.zero_copy_output);
         assert!(capabilities.low_latency);
+    }
+
+    #[test]
+    fn openh264_network_encoder_bounds_video_slice_nals() {
+        let size = crate::FrameSize::new(640, 360).unwrap();
+        let mut source = SyntheticFrameSource::new(size, 30).unwrap();
+        let frame = source.capture().unwrap();
+        let mut encoder = OpenH264Encoder::new_network(4_000_000, 30.0, 0, 900).unwrap();
+        let EncodeOutcome::Packet(packet) = encoder.encode(frame).unwrap() else {
+            panic!("the first network frame must not be skipped");
+        };
+        let video_nals: Vec<_> = crate::split_h264_nal_units(packet.data())
+            .unwrap()
+            .into_iter()
+            .filter(|nal| {
+                nal.first()
+                    .is_some_and(|header| header & 0x1f == 1 || header & 0x1f == 5)
+            })
+            .collect();
+        assert!(
+            video_nals.len() > 1,
+            "the frame should be split into multiple slices"
+        );
+        assert!(video_nals.iter().all(|nal| nal.len() <= 900));
     }
 }

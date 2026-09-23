@@ -83,6 +83,13 @@ falling back to OpenH264. The current Media Foundation adapter accepts CPU BGRA 
 converts them to NV12, so it is a hardware compression path but not yet a D3D11 zero-copy path.
 Host logs report the selected backend and its hardware/zero-copy capability.
 
+OpenH264 is only the last compatibility fallback when no usable Media Foundation encoder can be
+initialized or an active MFT fails. A software-only MFT is still preferred: at 1440x900 the tested
+OpenH264 fallback commonly required hundreds of milliseconds per encoded frame and occasionally
+about two seconds, which is unsuitable for interactive desktop latency. MFT startup logs list each
+accepted and rejected `ICodecAPI` rate-control setting; preserve these lines with test results so an
+oversized frame can be traced to unsupported CBR/VBV/QP controls rather than to encoder selection.
+
 ## Runtime scenarios
 
 Run the capture command in these situations and record the exact command, console output, Windows

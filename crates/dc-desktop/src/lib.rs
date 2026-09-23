@@ -183,6 +183,9 @@ impl RateController {
 
 pub fn validate_input(event: &InputEvent, width: u32, height: u32) -> Result<()> {
     match event {
+        InputEvent::Pointer { buttons, .. } if buttons & !0x07 != 0 => Err(DcError::InvalidInput(
+            "pointer contains unsupported button bits".into(),
+        )),
         InputEvent::Pointer { x, y, .. }
             if *x < 0 || *y < 0 || *x >= width as i32 || *y >= height as i32 =>
         {
@@ -190,7 +193,14 @@ pub fn validate_input(event: &InputEvent, width: u32, height: u32) -> Result<()>
                 "pointer position is outside the desktop".into(),
             ))
         }
-        InputEvent::Pointer { .. } | InputEvent::Key { .. } => Ok(()),
+        InputEvent::Wheel { delta_x, delta_y }
+            if delta_x.unsigned_abs() > 12_000 || delta_y.unsigned_abs() > 12_000 =>
+        {
+            Err(DcError::InvalidInput(
+                "wheel delta exceeds the per-event limit".into(),
+            ))
+        }
+        InputEvent::Pointer { .. } | InputEvent::Wheel { .. } | InputEvent::Key { .. } => Ok(()),
     }
 }
 
@@ -242,9 +252,48 @@ mod tests {
         });
         assert!(result.bitrate < 1_000 && result.frames_per_second < 30);
     }
+
+    #[test]
+    fn validates_pointer_buttons_and_wheel_bounds() {
+        assert!(validate_input(
+            &InputEvent::Wheel {
+                delta_x: 120,
+                delta_y: -240,
+            },
+            100,
+            100,
+        )
+        .is_ok());
+        assert!(validate_input(
+            &InputEvent::Wheel {
+                delta_x: 0,
+                delta_y: 12_001,
+            },
+            100,
+            100,
+        )
+        .is_err());
+        assert!(validate_input(
+            &InputEvent::Pointer {
+                x: 1,
+                y: 1,
+                buttons: 0x80,
+            },
+            100,
+            100,
+        )
+        .is_err());
+    }
 }
 
+mod region;
 mod video_datagram;
 
-pub use video_datagram::packetize_video_message;
-pub use video_datagram::{VideoDatagramReassembler, VideoDatagramStats};
+pub use region::{
+    changed_area, decode_region_payload, encode_region_update, DirtyRegionDetector,
+    REGION_ENCODING_PACK_BITS, REGION_ENCODING_RAW,
+};
+pub use video_datagram::{packetize_h264_nal_message, packetize_video_message};
+pub use video_datagram::{
+    H264NalDatagramReassembler, VideoDatagramReassembler, VideoDatagramStats,
+};
