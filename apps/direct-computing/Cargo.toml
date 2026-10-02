@@ -15,6 +15,7 @@ x264 = ["dc-platform/x264"]
 [dependencies]
 dc-common = { path = "../../crates/dc-common" }
 dc-auth = { path = "../../crates/dc-auth" }
+dc-av1 = { path = "../../crates/dc-av1" }
 dc-desktop = { path = "../../crates/dc-desktop" }
 dc-media = { path = "../../crates/dc-media" }
 dc-protocol = { path = "../../crates/dc-protocol" }

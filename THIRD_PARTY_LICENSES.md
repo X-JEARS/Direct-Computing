@@ -25,6 +25,7 @@ crate's source distribution.
 | raw-window-handle | 0.6.2 | MIT OR Apache-2.0 OR Zlib |
 | safe_arch | 1.2.0 | Zlib OR Apache-2.0 OR MIT |
 | same-file | 1.0.6 | Unlicense OR MIT |
+| shiguredo_aom | 2026.1.0 | Apache-2.0 (libaom BSD-2-Clause) |
 | shlex | 2.0.1 | MIT OR Apache-2.0 |
 | syn | 2.0.106 | MIT OR Apache-2.0 |
 | unicode-ident | 1.0.26 | (MIT OR Apache-2.0) AND Unicode-3.0 |

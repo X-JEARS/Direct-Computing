@@ -1,6 +1,6 @@
 //! Versioned protocol primitives shared by hosts, viewers, and CLI clients.
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 2, minor: 1 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 2, minor: 2 };
 
 /// Maximum encoded protocol message accepted from a peer.  Keeping this limit at the
 /// protocol boundary prevents a malformed length field from turning into an allocation
@@ -45,6 +45,8 @@ pub struct Capabilities {
     pub h264_nal_datagrams: bool,
     /// Supports selective retransmission of missing legacy desktop-media fragments.
     pub desktop_selective_retransmit: bool,
+    /// Supports AV1 video encoded and decoded by libaom.
+    pub av1_software: bool,
 }
 
 pub const MAX_DESKTOP_REGIONS: usize = 256;
@@ -624,7 +626,8 @@ fn put_capabilities(out: &mut Vec<u8>, value: Capabilities) {
         | (u16::from(value.hybrid_video) << 7)
         | (u16::from(value.desktop_optimizations) << 8)
         | (u16::from(value.h264_nal_datagrams) << 9)
-        | (u16::from(value.desktop_selective_retransmit) << 10);
+        | (u16::from(value.desktop_selective_retransmit) << 10)
+        | (u16::from(value.av1_software) << 11);
     put_u16(out, flags);
 }
 fn put_bytes(out: &mut Vec<u8>, value: &[u8]) -> dc_common::Result<()> {
@@ -698,6 +701,7 @@ impl<'a> Reader<'a> {
             desktop_optimizations: flags & 256 != 0,
             h264_nal_datagrams: flags & 512 != 0,
             desktop_selective_retransmit: flags & 1024 != 0,
+            av1_software: flags & 2048 != 0,
         })
     }
 }
@@ -804,6 +808,7 @@ mod tests {
                 desktop_optimizations: true,
                 h264_nal_datagrams: true,
                 desktop_selective_retransmit: true,
+                av1_software: true,
                 ..Capabilities::default()
             },
         };

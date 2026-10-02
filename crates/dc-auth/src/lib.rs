@@ -51,6 +51,7 @@ impl Permissions {
             desktop_optimizations: false,
             h264_nal_datagrams: false,
             desktop_selective_retransmit: false,
+            av1_software: false,
         }
     }
 }

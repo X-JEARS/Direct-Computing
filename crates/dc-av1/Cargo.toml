@@ -1,0 +1,18 @@
+[package]
+name = "dc-av1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bundled libaom AV1 adapter for Direct Computing"
+
+[features]
+source-build = ["shiguredo_aom/source-build"]
+
+[dependencies]
+dc-common = { path = "../dc-common" }
+dc-media = { path = "../dc-media", default-features = false }
+shiguredo_aom = "=2026.1.0"
+
+[lints]
+workspace = true

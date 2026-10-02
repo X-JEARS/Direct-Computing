@@ -1,4 +1,5 @@
 use dc_auth::{PasswordVerifier, Permissions};
+use dc_av1::{LibaomAv1Decoder, LibaomAv1Encoder};
 use dc_common::{init_logging, log, DcError, LogLevel, Result};
 use dc_desktop::validate_input;
 use dc_desktop::{
@@ -10,7 +11,7 @@ use dc_desktop::{
 use dc_media::{write_bmp, LastFrameSink};
 use dc_media::{
     ChecksumSink, FrameSize, LoopbackPipeline, OpenH264Decoder, OpenH264Encoder, PixelFormat,
-    SyntheticFrameSource, VideoEncoder, VideoFrame,
+    SyntheticFrameSource, VideoCodec, VideoEncoder, VideoFrame,
 };
 #[cfg(target_os = "macos")]
 use dc_platform::VideoToolboxH264Decoder;
@@ -84,7 +85,7 @@ const RATE_UPGRADE_MIN_INTER_FRAMES: u32 = 8;
 const MAX_DATAGRAM_FRAGMENTS_PER_FRAME: usize = 96;
 const STARTUP_ZERO_FRAME_GRACE: Duration = Duration::from_secs(2);
 const NETWORK_CHROMA_SUBSAMPLING: &str = "4:2:0";
-const MEDIA_PROTOCOL_REVISION: &str = "hybrid-v5-selective-regions";
+const MEDIA_PROTOCOL_REVISION: &str = "hybrid-v6-av1-fallback";
 const FULL_FRAME_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const REGION_UPDATE_MAX_BYTES: usize = 256 * 1024;
 const RETRANSMIT_CACHE_LIFETIME: Duration = Duration::from_millis(1_500);
@@ -342,6 +343,7 @@ struct MediaFeatures {
     desktop_optimizations: bool,
     h264_nal_datagrams: bool,
     desktop_selective_retransmit: bool,
+    av1_software: bool,
 }
 
 fn main() {
@@ -530,6 +532,7 @@ fn run_network_host(
                     desktop_optimizations: true,
                     h264_nal_datagrams: true,
                     desktop_selective_retransmit: true,
+                    av1_software: true,
                     ..Capabilities::default()
                 },
             )
@@ -541,6 +544,7 @@ fn run_network_host(
                 hybrid_video && session.peer_capabilities.h264_nal_datagrams;
             let desktop_selective_retransmit = desktop_optimizations
                 && session.peer_capabilities.desktop_selective_retransmit;
+            let av1_software = session.peer_capabilities.av1_software;
             log(
                 LogLevel::Info,
                 "direct-computing::host",
@@ -752,49 +756,28 @@ async fn send_desktop_frames(
                     ));
                 }
             }
-            // Prefer the vendor-provided Media Foundation encoder at every
-            // bitrate.  It is hardware accelerated when the host exposes a
-            // compatible MFT and has much lower encode latency than the
-            // software fallback.  OpenH264 remains the fallback if the MFT is
-            // unavailable or rejects the requested profile.
+            // H.264 is used only when Media Foundation selected a real
+            // hardware transform. Otherwise the negotiated software fallback
+            // is libaom AV1, which receives complete desktop canvases and
+            // maintains its own inter-frame reference chain.
             match WindowsMediaFoundationH264Encoder::new(size.width(), size.height(), bitrate, fps)
             {
-                Ok(encoder) => {
-                    if !encoder.capabilities().hardware_accelerated {
-                        // Keep the system software MFT ahead of OpenH264. The
-                        // latter is a compatibility fallback and is far too
-                        // slow for a full-resolution interactive desktop on
-                        // the tested host. MFT codec-control acceptance is
-                        // logged by dc-platform for bitrate diagnostics.
-                        log(
-                            LogLevel::Info,
-                            "direct-computing::stream-host",
-                            "Media Foundation H.264 MFT is software-only; retaining MFT because OpenH264 is an emergency compatibility fallback",
-                        );
-                    }
-                    Ok(Box::new(encoder))
-                }
+                Ok(encoder) if encoder.capabilities().hardware_accelerated => Ok(Box::new(encoder)),
+                Ok(_) => create_libaom_fallback(
+                    frame,
+                    bitrate,
+                    fps,
+                    features.av1_software,
+                    "Media Foundation H.264 encoder is software-only",
+                ),
                 Err(error) => {
-                    log(
-                        LogLevel::Warn,
-                        "direct-computing::stream-host",
-                        &format!("Media Foundation unavailable, using OpenH264 fallback: {error}"),
-                    );
-                    let minimum_qp = if bitrate <= 64_000 { 42 } else { 36 };
-                    log(
-                        LogLevel::Info,
-                        "direct-computing::stream-host",
-                        &format!(
-                            "using OpenH264 low-quality fallback bitrate={} fps={} qp={}..51",
-                            bitrate, fps, minimum_qp
-                        ),
-                    );
-                    Ok(Box::new(OpenH264Encoder::new_network(
+                    create_libaom_fallback(
+                        frame,
                         bitrate,
-                        fps as f32,
-                        minimum_qp,
-                        max_slice_len,
-                    )?))
+                        fps,
+                        features.av1_software,
+                        &format!("Media Foundation H.264 encoder unavailable: {error}"),
+                    )
                 }
             }
         },
@@ -819,7 +802,7 @@ async fn send_desktop_frames(
         features,
         retransmit_cache,
         profile,
-        move |frame, bitrate, fps, max_slice_len| {
+        move |frame, bitrate, fps, _max_slice_len| {
             if use_x264 {
                 #[cfg(all(feature = "x264", target_os = "windows"))]
                 {
@@ -829,7 +812,7 @@ async fn send_desktop_frames(
                         size.height(),
                         bitrate,
                         fps,
-                        max_slice_len,
+                        _max_slice_len,
                     )?) as Box<dyn dc_media::VideoEncoder>);
                 }
                 #[cfg(not(all(feature = "x264", target_os = "windows")))]
@@ -840,15 +823,45 @@ async fn send_desktop_frames(
                     ));
                 }
             }
-            Ok(Box::new(OpenH264Encoder::new_network(
+            create_libaom_fallback(
+                frame,
                 bitrate,
-                fps as f32,
-                0,
-                max_slice_len,
-            )?))
+                fps,
+                features.av1_software,
+                "platform has no hardware H.264 encoder",
+            )
         },
     )
     .await
+}
+
+fn create_libaom_fallback(
+    frame: &VideoFrame,
+    bitrate: u32,
+    fps: u32,
+    negotiated: bool,
+    reason: &str,
+) -> Result<Box<dyn dc_media::VideoEncoder>> {
+    if !negotiated {
+        return Err(DcError::Unsupported(format!(
+            "{reason}; peer did not advertise libaom AV1 support"
+        )));
+    }
+    let size = frame.layout().size();
+    log(
+        LogLevel::Info,
+        "direct-computing::stream-host",
+        &format!(
+            "{reason}; using libaom AV1 software encoder with full-canvas inter-frame compression bitrate={} fps={}",
+            bitrate, fps
+        ),
+    );
+    Ok(Box::new(LibaomAv1Encoder::new(
+        size.width(),
+        size.height(),
+        bitrate,
+        fps,
+    )?))
 }
 
 async fn send_frames_from<S, F>(
@@ -871,6 +884,7 @@ where
         desktop_optimizations,
         h264_nal_datagrams,
         desktop_selective_retransmit,
+        av1_software: _,
     } = features;
     let max_datagram_size = connection.max_datagram_size().ok_or_else(|| {
         DcError::Unsupported("peer did not negotiate QUIC DATAGRAM support".into())
@@ -944,6 +958,7 @@ where
         let mut current_bitrate = producer_control.target_bitrate.load(Ordering::Acquire);
         let mut current_fps = producer_control.target_fps.load(Ordering::Acquire);
         let mut encoder = create_encoder(&pending.0, current_bitrate, current_fps, max_slice_len)?;
+        let mut full_canvas_interframe = encoder.codec() == VideoCodec::Av1;
         let mut last_frame;
         let mut last_sequence;
         let capabilities = encoder.capabilities();
@@ -965,8 +980,11 @@ where
             LogLevel::Info,
             "direct-computing::stream-host",
             &format!(
-                "video format=H.264 chroma={} color_depth={}bit",
-                NETWORK_CHROMA_SUBSAMPLING, profile.color_depth_bits
+                "video format={:?} chroma={} color_depth={}bit full_canvas_interframe={}",
+                capabilities.codec,
+                NETWORK_CHROMA_SUBSAMPLING,
+                profile.color_depth_bits,
+                full_canvas_interframe
             ),
         );
         let mut frame_interval = Duration::from_secs_f64(1.0 / f64::from(current_fps));
@@ -1050,6 +1068,7 @@ where
                 current_fps = target_fps;
                 frame_interval = Duration::from_secs_f64(1.0 / f64::from(current_fps));
                 encoder = create_encoder(&frame, current_bitrate, current_fps, max_slice_len)?;
+                full_canvas_interframe = encoder.codec() == VideoCodec::Av1;
                 producer_control
                     .keyframe_requested
                     .store(false, Ordering::Release);
@@ -1080,6 +1099,7 @@ where
                 }
             }
             let region_candidate = desktop_optimizations
+                && !full_canvas_interframe
                 && !force_full_frame
                 && !dirty_regions.is_empty()
                 && last_full_frame_at.elapsed() < FULL_FRAME_REFRESH_INTERVAL;
@@ -1124,6 +1144,7 @@ where
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                 }
             } else if dirty_regions.is_empty()
+                && !full_canvas_interframe
                 && !force_full_frame
                 && last_full_frame_at.elapsed() < FULL_FRAME_REFRESH_INTERVAL
             {
@@ -1712,7 +1733,15 @@ impl dc_media::VideoDecoder for WindowsViewerDecoder {
 }
 
 #[cfg(target_os = "windows")]
-fn create_viewer_decoder() -> Result<Box<dyn dc_media::VideoDecoder>> {
+fn create_viewer_decoder(codec: VideoCodec) -> Result<Box<dyn dc_media::VideoDecoder>> {
+    if codec == VideoCodec::Av1 {
+        return Ok(Box::new(LibaomAv1Decoder::new()?));
+    }
+    if codec != VideoCodec::H264 {
+        return Err(DcError::Unsupported(format!(
+            "viewer does not support {codec:?} video"
+        )));
+    }
     // The stream dimensions are learned from the first packet, so the
     // Windows MFT is initialized lazily in run_network_viewer.
     Ok(Box::new(WindowsViewerDecoder {
@@ -1723,7 +1752,15 @@ fn create_viewer_decoder() -> Result<Box<dyn dc_media::VideoDecoder>> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn create_viewer_decoder() -> Result<Box<dyn dc_media::VideoDecoder>> {
+fn create_viewer_decoder(codec: VideoCodec) -> Result<Box<dyn dc_media::VideoDecoder>> {
+    if codec == VideoCodec::Av1 {
+        return Ok(Box::new(LibaomAv1Decoder::new()?));
+    }
+    if codec != VideoCodec::H264 {
+        return Err(DcError::Unsupported(format!(
+            "viewer does not support {codec:?} video"
+        )));
+    }
     #[cfg(target_os = "macos")]
     {
         match VideoToolboxH264Decoder::new() {
@@ -1814,6 +1851,7 @@ fn run_network_viewer(
                     desktop_optimizations: true,
                     h264_nal_datagrams: true,
                     desktop_selective_retransmit: true,
+                    av1_software: true,
                     ..Capabilities::default()
                 },
             )
@@ -1830,6 +1868,7 @@ fn run_network_viewer(
                 host_hybrid_video && session.peer_capabilities.h264_nal_datagrams;
             let host_desktop_selective_retransmit = host_desktop_optimizations
                 && session.peer_capabilities.desktop_selective_retransmit;
+            let host_av1_software = session.peer_capabilities.av1_software;
             let _ = control.receive().await?;
             let max_datagram_size = connection.max_datagram_size();
             log(
@@ -1874,7 +1913,7 @@ fn run_network_viewer(
                     "Host does not advertise hybrid media; using legacy Datagram keyframes",
                 );
             }
-            let mut decoder = create_viewer_decoder()?;
+            let mut decoder: Option<Box<dyn dc_media::VideoDecoder>> = None;
             let mut sink = PreviewWindowSink::new("Direct Computing - Remote Desktop");
             sink.set_dirty_region_debug(show_dirty_regions);
             if show_dirty_regions {
@@ -2307,9 +2346,20 @@ fn run_network_viewer(
                         // Reset VideoToolbox/OpenH264 before consuming the
                         // recovery keyframe so no references from the damaged
                         // GOP survive into the new decode chain.
-                        decoder = create_viewer_decoder()?;
+                        if packet.codec() == VideoCodec::Av1 && !host_av1_software {
+                            return Err(DcError::Codec(
+                                "Host sent AV1 without negotiating AV1 support".into(),
+                            ));
+                        }
+                        decoder = Some(create_viewer_decoder(packet.codec())?);
                     }
-                    let frame = match decoder.decode(packet) {
+                    let frame = match decoder
+                        .as_mut()
+                        .ok_or_else(|| {
+                            DcError::Codec("video stream started without a keyframe".into())
+                        })?
+                        .decode(packet)
+                    {
                         Ok(frame) => {
                             waiting_for_keyframe = false;
                             frame

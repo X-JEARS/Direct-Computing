@@ -12,6 +12,7 @@ pub fn packet_to_message(packet: &EncodedVideoPacket) -> Result<WireMessage> {
     let codec = match packet.codec() {
         VideoCodec::Raw => 0,
         VideoCodec::H264 => 1,
+        VideoCodec::Av1 => 2,
     };
     let pixel_format = match layout.pixel_format() {
         PixelFormat::Rgb24 => 0,
@@ -106,6 +107,7 @@ fn packet_from_parts(
     let codec = match codec {
         0 => VideoCodec::Raw,
         1 => VideoCodec::H264,
+        2 => VideoCodec::Av1,
         _ => return Err(DcError::Codec("unknown video codec".into())),
     };
     let pixel_format = match pixel_format {
@@ -226,6 +228,24 @@ mod tests {
             message_to_packet(packet_to_message(&packet).unwrap()).unwrap(),
             packet
         );
+    }
+
+    #[test]
+    fn av1_packet_message_round_trip_uses_codec_two() {
+        let size = FrameSize::new(2, 2).unwrap();
+        let layout = FrameLayout::packed(size, PixelFormat::Bgra32).unwrap();
+        let packet = EncodedVideoPacket::new(
+            VideoCodec::Av1,
+            9,
+            Duration::from_millis(33),
+            false,
+            layout,
+            vec![0x12, 0x34, 0x56],
+        )
+        .unwrap();
+        let message = packet_to_message(&packet).unwrap();
+        assert!(matches!(message, WireMessage::Video { codec: 2, .. }));
+        assert_eq!(message_to_packet(message).unwrap(), packet);
     }
 
     #[test]

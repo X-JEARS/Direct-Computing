@@ -64,11 +64,13 @@ Host resends the cached final Datagram bytes. The cache is bounded to eight upda
 instead of applying a patch to an unknown base. Larger or incompressible changes automatically
 fall back to the normal H.264 path.
 
-Windows Host encoder preference is hardware Media Foundation H.264, then software Media
-Foundation H.264. OpenH264 is retained only as a compatibility fallback when Media Foundation
-cannot supply a usable encoder; it is not the preferred full-resolution interactive path because
-measured software encode latency can reach hundreds of milliseconds or more. MFT startup logs show
-which CBR/VBV/QP and low-latency controls the selected transform actually accepted.
+Windows Host encoder preference is hardware Media Foundation H.264. If Media Foundation cannot
+provide a hardware H.264 transform, the Host negotiates and selects the bundled libaom AV1
+software encoder. AV1 receives the complete BGRA canvas on every encoded capture and uses its
+reference-frame machinery for inter-frame delta compression; dirty-region bypass is disabled for
+this mode. The Viewer uses the matching bundled libaom decoder. Software-only H.264 MFTs are not
+selected for the interactive path. MFT startup logs show which CBR/VBV/QP and low-latency controls
+the selected hardware transform actually accepted.
 
 Peers from this revision negotiate H.264 NAL Datagram transport. The Host parses each encoded
 access unit into SPS/PPS/SEI/slice NAL units, packetizes each NAL independently, and the Viewer

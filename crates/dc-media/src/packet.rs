@@ -6,6 +6,7 @@ use std::time::Duration;
 pub enum VideoCodec {
     Raw,
     H264,
+    Av1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

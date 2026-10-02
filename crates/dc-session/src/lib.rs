@@ -53,6 +53,7 @@ pub async fn authenticate_server(
     advertised_permissions.desktop_optimizations = capabilities.desktop_optimizations;
     advertised_permissions.h264_nal_datagrams = capabilities.h264_nal_datagrams;
     advertised_permissions.desktop_selective_retransmit = capabilities.desktop_selective_retransmit;
+    advertised_permissions.av1_software = capabilities.av1_software;
     stream
         .send(&WireMessage::Authenticated {
             permissions: advertised_permissions,

@@ -8,6 +8,7 @@ members = [
     "crates/dc-session",
     "crates/dc-desktop",
     "crates/dc-media",
+    "crates/dc-av1",
     "crates/dc-terminal",
     "crates/dc-command",
     "crates/dc-file-transfer",
@@ -22,7 +23,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
